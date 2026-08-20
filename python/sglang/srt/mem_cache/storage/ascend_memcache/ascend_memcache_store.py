@@ -70,9 +70,9 @@ class AscendMemcacheConfig:
                     merged.update(json.load(fin))
                 logger.info("Memcache configuration loaded from %s", path)
             except Exception as exc:
-                logger.warning(
-                    "Failed to load memcache configuration from %s: %s", path, exc
-                )
+                raise ValueError(
+                    f"Failed to load Memcache configuration from {path}: {exc}"
+                ) from exc
 
         extra = getattr(storage_config, "extra_config", None) or {}
         merged.update(extra)
@@ -339,6 +339,13 @@ class AscendMemcacheStore(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        # DSV4 FULL is a logical anchor. It owns hashes/slots but no payload.
+        if self.mem_pool_host.kv_buffer is None:
+            self.gb_per_page = 0.0
+            logger.info(
+                "Ascend Memcache registered logical KV anchor without a buffer."
+            )
+            return
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -370,6 +377,17 @@ class AscendMemcacheStore(HiCacheStorage):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        layout = getattr(host_pool, "layout", None)
+        if layout not in {
+            "page_first",
+            "page_first_direct",
+            "page_head",
+            "page_first_kv_split",
+        }:
+            raise ValueError(
+                "Ascend Memcache hybrid pools require a storage-compatible "
+                f"page-first layout, got {layout!r} for {host_pool_name}."
+            )
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
@@ -411,6 +429,19 @@ class AscendMemcacheStore(HiCacheStorage):
             suffixes = [f"{base_suffix}_temporal"] + [
                 f"{base_suffix}_conv_{i}" for i in range(conv_num)
             ]
+        elif name == PoolName.DEEPSEEK_V4_C4_INDEXER:
+            suffixes = [
+                f"_{self.mla_suffix}_{name}_k",
+                f"_{self.mla_suffix}_{name}_scale",
+            ]
+        elif name in (
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        ):
+            suffixes = [f"_{self.mla_suffix}_{name}"]
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
@@ -423,8 +454,11 @@ class AscendMemcacheStore(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(keys, extra_info)
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            # Logical anchor: required physical pools decide the usable prefix.
+            kv_pages = len(keys)
+        else:
+            kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -432,9 +466,23 @@ class AscendMemcacheStore(HiCacheStorage):
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break
+            coverage = transfer.anchor_pages_per_key
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                if coverage != 1:
+                    raise ValueError(
+                        f"TRAILING_PAGES pool {transfer.name} cannot use "
+                        f"anchor_pages_per_key={coverage}."
+                    )
+                object_anchor_keys = keys[:kv_pages]
+            elif coverage == 1:
+                object_anchor_keys = keys[:kv_pages]
+            else:
+                object_anchor_keys = keys[coverage - 1 : kv_pages : coverage]
+
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                qkeys, transfer
+                object_anchor_keys, transfer
             )
+            component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
             if key_multiplier > 0:
                 page_exists = [
@@ -442,19 +490,22 @@ class AscendMemcacheStore(HiCacheStorage):
                         r == 1
                         for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
                     )
-                    for i in range(kv_pages)
+                    for i in range(len(object_anchor_keys))
                 ]
             else:
                 page_exists = [False] * kv_pages
             boundary = 0
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 try:
-                    boundary = page_exists.index(False)
+                    object_boundary = page_exists.index(False)
                 except ValueError:
-                    boundary = kv_pages
+                    object_boundary = len(page_exists)
+                boundary = min(final_pages, object_boundary * coverage)
+                if coverage > 1:
+                    boundary -= boundary % coverage
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
+                for prefix_len in range(final_pages, 0, -1):
                     if all(
                         page_exists[i]
                         for i in range(max(0, prefix_len - trailing), prefix_len)
@@ -495,11 +546,24 @@ class AscendMemcacheStore(HiCacheStorage):
                     f"len(keys)={len(keys)}, len(host_indices)={len(host_indices)}, page_size={page_size}."
                 )
 
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            ptr_list, element_size_list = self._get_transfer_buffer_meta(
+                host_pool, transfer, host_indices
+            )
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
+            if key_multiplier <= 0:
+                raise ValueError(f"Unsupported hybrid pool for Memcache: {transfer.name}")
+            if not (
+                len(key_strs) == len(ptr_list) == len(element_size_list)
+            ):
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' physical object mismatch: "
+                    f"keys={len(key_strs)}, ptrs={len(ptr_list)}, "
+                    f"sizes={len(element_size_list)}. Use a storage-compatible "
+                    "page-first host layout."
+                )
 
             if is_set:
                 exist_result = self._batch_exist(key_strs)
@@ -524,6 +588,30 @@ class AscendMemcacheStore(HiCacheStorage):
             )
             results[transfer.name] = pool_results
         return results
+
+    def _get_transfer_buffer_meta(self, host_pool, transfer, host_indices):
+        ptrs, sizes = host_pool.get_page_buffer_meta(host_indices)
+        if transfer.name != PoolName.DEEPSEEK_V4_C4_INDEXER:
+            return ptrs, sizes
+
+        if getattr(host_pool, "scale_kv_buffer", None) is None:
+            raise RuntimeError(
+                "NPU DSV4 C4 indexer storage requires both K and scale buffers."
+            )
+        scale_ptrs, scale_sizes = host_pool.get_scale_page_buffer_meta(host_indices)
+        if len(ptrs) != len(scale_ptrs):
+            raise ValueError(
+                "C4 indexer K/scale page metadata have different cardinalities: "
+                f"K={len(ptrs)}, scale={len(scale_ptrs)}."
+            )
+        object_ptrs = []
+        object_sizes = []
+        for k_ptr, k_size, scale_ptr, scale_size in zip(
+            ptrs, sizes, scale_ptrs, scale_sizes
+        ):
+            object_ptrs.extend((k_ptr, scale_ptr))
+            object_sizes.extend((k_size, scale_size))
+        return object_ptrs, object_sizes
 
     def batch_get_v2(
         self,
@@ -600,6 +688,11 @@ class AscendMemcacheStore(HiCacheStorage):
                 if self.storage_config and self.storage_config.should_split_heads:
                     key_multiplier *= self.split_factor
 
+        if key_multiplier <= 0 or len(results) % key_multiplier != 0:
+            raise RuntimeError(
+                "Memcache result cardinality is not divisible by the physical "
+                f"object multiplier: results={len(results)}, multiplier={key_multiplier}."
+            )
         result_groups = [
             results[i : i + key_multiplier]
             for i in range(0, len(results), key_multiplier)
@@ -619,6 +712,8 @@ class AscendMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
 
@@ -644,6 +739,8 @@ class AscendMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
         # Apply extra_backend_tag prefix if available
         page_keys = self._tag_keys(keys)
 
@@ -812,6 +909,8 @@ class AscendMemcacheStore(HiCacheStorage):
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return len(keys)
         page_keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
@@ -861,12 +960,23 @@ class AscendMemcacheStore(HiCacheStorage):
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        raw = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        if len(raw) != len(key_strs):
+            raise RuntimeError(
+                f"Memcache batch_put_from returned {len(raw)} results for "
+                f"{len(key_strs)} objects."
+            )
+        return [int(code) for code in raw]
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
         raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        if len(raw) != len(key_strs):
+            raise RuntimeError(
+                f"Memcache batch_get_into returned {len(raw)} results for "
+                f"{len(key_strs)} objects."
+            )
         # memcache_hybrid reports 0 on success, but HiCache read postprocess expects
         # positive values for success and negative values for failures.
         out: List[int] = []
@@ -879,7 +989,15 @@ class AscendMemcacheStore(HiCacheStorage):
         return out
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self.store.batch_is_exist(key_strs)
+        if not key_strs:
+            return []
+        raw = self.store.batch_is_exist(key_strs)
+        if len(raw) != len(key_strs):
+            raise RuntimeError(
+                f"Memcache batch_is_exist returned {len(raw)} results for "
+                f"{len(key_strs)} objects."
+            )
+        return [int(code) for code in raw]
 
     def get_stats(self):
         storage_metrics = StorageMetrics()

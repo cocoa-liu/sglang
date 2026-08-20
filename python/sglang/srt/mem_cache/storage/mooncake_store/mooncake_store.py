@@ -792,11 +792,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{self.mha_suffix}_{pool_name}_k",
                     f"_{self.mha_suffix}_{pool_name}_v",
                 ]
+        elif pool_name == PoolName.DEEPSEEK_V4_C4_INDEXER:
+            suffixes = [
+                f"_{self.mla_suffix}_{pool_name}_k",
+                f"_{self.mla_suffix}_{pool_name}_scale",
+            ]
         elif pool_name in (
             PoolName.INDEXER,
             PoolName.DRAFT_INDEXER,
             PoolName.DEEPSEEK_V4_C4,
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
             PoolName.DEEPSEEK_V4_C128,
             PoolName.DEEPSEEK_V4_C4_STATE,
             PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
@@ -845,8 +849,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break
+            coverage = transfer.anchor_pages_per_key
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                if coverage != 1:
+                    raise ValueError(
+                        f"TRAILING_PAGES pool {transfer.name} cannot use "
+                        f"anchor_pages_per_key={coverage}."
+                    )
+                object_anchor_keys = keys[:kv_pages]
+            elif coverage == 1:
+                object_anchor_keys = keys[:kv_pages]
+            else:
+                object_anchor_keys = keys[coverage - 1 : kv_pages : coverage]
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                object_anchor_keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
@@ -856,19 +872,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         r == 1
                         for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
                     )
-                    for i in range(kv_pages)
+                    for i in range(len(object_anchor_keys))
                 ]
             else:
                 page_exists = [False] * kv_pages
             boundary = 0
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 try:
-                    boundary = page_exists.index(False)
+                    object_boundary = page_exists.index(False)
                 except ValueError:
-                    boundary = kv_pages
+                    object_boundary = len(page_exists)
+                boundary = min(final_pages, object_boundary * coverage)
+                if coverage > 1:
+                    boundary -= boundary % coverage
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
+                for prefix_len in range(final_pages, 0, -1):
                     if all(
                         page_exists[i]
                         for i in range(max(0, prefix_len - trailing), prefix_len)
@@ -899,9 +918,40 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             key_strs = self._tag_keys(key_strs)
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            if transfer.name == PoolName.DEEPSEEK_V4_C4_INDEXER:
+                if getattr(host_pool, "scale_kv_buffer", None) is None:
+                    raise RuntimeError(
+                        "NPU DSV4 C4 indexer storage requires K and scale buffers."
+                    )
+                scale_ptrs, scale_sizes = host_pool.get_scale_page_buffer_meta(
+                    host_indices
+                )
+                if len(ptr_list) != len(scale_ptrs):
+                    raise ValueError(
+                        "C4 indexer K/scale page metadata cardinality mismatch: "
+                        f"K={len(ptr_list)}, scale={len(scale_ptrs)}."
+                    )
+                ptr_list = [
+                    value
+                    for pair in zip(ptr_list, scale_ptrs)
+                    for value in pair
+                ]
+                element_size_list = [
+                    value
+                    for pair in zip(element_size_list, scale_sizes)
+                    for value in pair
+                ]
             if transfer.name == PoolName.DEEPSEEK_V4_C4:
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
+                )
+            if not (
+                len(key_strs) == len(ptr_list) == len(element_size_list)
+            ):
+                raise ValueError(
+                    f"Mooncake transfer {transfer.name} physical object mismatch: "
+                    f"keys={len(key_strs)}, ptrs={len(ptr_list)}, "
+                    f"sizes={len(element_size_list)}."
                 )
 
             if is_set:
