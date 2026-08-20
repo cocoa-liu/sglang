@@ -139,6 +139,17 @@ class CacheOperation:
             parts = [tensor for tensor in tensors if tensor is not None]
             return torch.cat(parts) if parts else None
 
+        for transfers in grouped.values():
+            if any(
+                transfer.anchor_pages_per_key
+                != transfers[0].anchor_pages_per_key
+                for transfer in transfers[1:]
+            ):
+                raise ValueError(
+                    f"Cannot merge {transfers[0].name} transfers with different "
+                    "anchor_pages_per_key values."
+                )
+
         return [
             PoolTransfer(
                 name=transfers[0].name,
@@ -147,6 +158,7 @@ class CacheOperation:
                 keys=[key for t in transfers if t.keys for key in t.keys] or None,
                 hit_policy=transfers[0].hit_policy,
                 indices_from_pool=transfers[0].indices_from_pool,
+                anchor_pages_per_key=transfers[0].anchor_pages_per_key,
             )
             for transfers in grouped.values()
         ]

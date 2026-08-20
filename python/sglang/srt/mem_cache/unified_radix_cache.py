@@ -2222,6 +2222,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     operation.storage_hit_count,
                     available_size - (available_size % self.page_size),
                 )
+                alloc_len = cc.align_storage_hit_tokens(operation, alloc_len)
                 if alloc_len >= self.prefetch_threshold:
                     host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:

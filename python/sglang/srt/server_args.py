@@ -8222,10 +8222,17 @@ class ServerArgs:
         elif cfg.hicache_io_backend == "kernel":
             new_layout = "page_first"
         elif cfg.hicache_io_backend == "kernel_ascend":
-            # Align with NPU defaults: MLA requires kv-split layout while
-            # non-MLA uses direct page-first layout.
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            # The generic MLA host pool has separate K/V buffers, while DSV4
+            # uses logical FULL plus independently paged C4/C128 pools. Those
+            # side pools do not implement page_first_kv_split and require one
+            # contiguous page object for zero-copy L3 I/O.
             new_layout = (
-                "page_first_kv_split" if self.use_mla_backend() else "page_first_direct"
+                "page_first_kv_split"
+                if self.use_mla_backend()
+                and not is_deepseek_v4(self.get_model_config().hf_config)
+                else "page_first_direct"
             )
         else:
             # Keep current behavior for unknown backends (e.g., kernel_ascend).
