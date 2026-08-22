@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import threading
 import time
@@ -26,6 +25,7 @@ from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
     PoolName,
@@ -587,6 +587,18 @@ class HybridCacheController(BaseHiCacheController):
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
         operation.all_hash_values = hash_value
+        assert isinstance(hash_value, list)
+
+        if operation.pool_transfers:
+            # Storage v2 backends treat transfer.keys as authoritative. Resolve
+            # placeholders/derived keys before exists() so query and I/O use the
+            # same object names.
+            self._sync_trailing_keys(
+                operation.pool_transfers, hash_value, len(hash_value)
+            )
+            for transfer in operation.pool_transfers:
+                if transfer.keys is None and transfer.indices_from_pool == PoolName.KV:
+                    transfer.keys = list(hash_value)
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -602,73 +614,12 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
-        self._normalize_storage_pool_transfers(
-            operation, hash_value, kv_hit_pages
-        )
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
 
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
-
-    def align_storage_hit_tokens(
-        self, operation: PrefetchOperation, token_count: int
-    ) -> int:
-        """Align a shortened prefetch allocation to every grouped object."""
-        coverage = 1
-        for transfer in operation.pool_transfers or []:
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                coverage = math.lcm(coverage, transfer.anchor_pages_per_key)
-        pages = token_count // self.page_size
-        return (pages - pages % coverage) * self.page_size
-
-    def _normalize_storage_pool_transfers(
-        self,
-        operation: PrefetchOperation,
-        anchor_hashes: list[str],
-        hit_anchor_pages: int,
-    ) -> None:
-        """Normalize object keys/slots after the final anchor hit is known.
-
-        Independent grouped pools such as NPU DSV4 C128 allocate host slots
-        before the storage query. Trim their transfer and queue the unused tail
-        here so exists/get/commit all observe the same object cardinality.
-        """
-        for transfer in operation.pool_transfers or []:
-            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                continue
-            coverage = transfer.anchor_pages_per_key
-            aligned_pages = hit_anchor_pages - hit_anchor_pages % coverage
-            if coverage == 1:
-                transfer.keys = list(anchor_hashes[:aligned_pages])
-            else:
-                transfer.keys = [
-                    anchor_hashes[i - 1]
-                    for i in range(coverage, aligned_pages + 1, coverage)
-                ]
-
-            if transfer.indices_from_pool is not None or transfer.host_indices is None:
-                continue
-            entry = self.mem_pool_host.entry_map.get(transfer.name)
-            if entry is None:
-                raise RuntimeError(
-                    f"Storage transfer host pool is not registered: {transfer.name}."
-                )
-            needed_slots = len(transfer.keys) * entry.host_pool.page_size
-            if transfer.host_indices.numel() < needed_slots:
-                raise ValueError(
-                    f"Storage transfer {transfer.name} has "
-                    f"{transfer.host_indices.numel()} host slots, needs {needed_slots}."
-                )
-            tail = transfer.host_indices[needed_slots:]
-            transfer.host_indices = transfer.host_indices[:needed_slots]
-            if tail.numel() > 0:
-                self.append_host_mem_release(
-                    extra_pools=[
-                        PoolTransfer(name=transfer.name, host_indices=tail)
-                    ]
-                )
 
     def move_hybrid_indices(
         self, operation: CacheOperation
@@ -694,14 +645,31 @@ class HybridCacheController(BaseHiCacheController):
                         keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
                         indices_from_pool=transfer.indices_from_pool,
-                        anchor_pages_per_key=transfer.anchor_pages_per_key,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
-        # KV pools and KV-derived pools first — determines actual completed page count
-        kv_completed_pages = super()._page_transfer(operation)
+        # A logical DSV4 FULL pool has no payload. Preserve the base controller's
+        # per-batch ACK contract while letting the physical sidecar pools decide
+        # whether the prefix is usable.
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            kv_completed_pages = 0
+            for offset in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+                if not operation.is_terminated():
+                    kv_completed_pages += len(
+                        operation.hash_value[offset : offset + STORAGE_BATCH_SIZE]
+                    )
+                self.prefetch_sync_queue.put(
+                    PrefetchAck(
+                        rid=operation.request_id,
+                        operation=operation,
+                        completed_tokens=kv_completed_pages * self.page_size,
+                    )
+                )
+        else:
+            # KV pools and KV-derived pools first determine completed page count.
+            kv_completed_pages = super()._page_transfer(operation)
 
         # Read non-KV derived sidecar pool, e.g. SWA, Mamba.
         self._page_transfer_sidecar(operation, kv_completed_pages)
@@ -726,9 +694,6 @@ class HybridCacheController(BaseHiCacheController):
                 for transfer in operation.pool_transfers
                 if transfer.indices_from_pool != PoolName.KV
             ]
-            self._normalize_storage_pool_transfers(
-                operation, operation.hash_value, kv_completed_pages
-            )
             self._sync_trailing_keys(
                 transfers_nonkv, operation.hash_value, kv_completed_pages
             )
@@ -763,7 +728,8 @@ class HybridCacheController(BaseHiCacheController):
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
-        if not self.backup_skip:
+        virtual_anchor = getattr(self.mem_pool_host, "kv_buffer", None) is None
+        if not self.backup_skip and not virtual_anchor:
             super()._page_backup(operation)
             if backup_transfers and not self._pool_results_complete(
                 backup_transfers, results
@@ -778,9 +744,7 @@ class HybridCacheController(BaseHiCacheController):
             )
 
     @staticmethod
-    def _pool_results_complete(
-        transfers: list[PoolTransfer], results: dict
-    ) -> bool:
+    def _pool_results_complete(transfers: list[PoolTransfer], results: dict) -> bool:
         for transfer in transfers:
             result = results.get(transfer.name)
             if result is None:

@@ -330,7 +330,6 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
-
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -836,7 +835,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        if self.mem_pool_host.kv_buffer is None:
+        logical_anchor = self.mem_pool_host.kv_buffer is None
+        if logical_anchor:
             # Logical anchor: no physical KV object exists in Mooncake, so the
             # usable prefix is determined entirely by required sidecar objects.
             kv_pages = len(keys)
@@ -849,18 +849,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break
-            coverage = transfer.anchor_pages_per_key
-            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                if coverage != 1:
-                    raise ValueError(
-                        f"TRAILING_PAGES pool {transfer.name} cannot use "
-                        f"anchor_pages_per_key={coverage}."
-                    )
-                object_anchor_keys = keys[:kv_pages]
-            elif coverage == 1:
-                object_anchor_keys = keys[:kv_pages]
-            else:
-                object_anchor_keys = keys[coverage - 1 : kv_pages : coverage]
+            object_anchor_keys = (
+                list(transfer.keys) if transfer.keys else list(keys[:kv_pages])
+            )
+            if not object_anchor_keys:
+                final_pages = 0
+                continue
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 object_anchor_keys, transfer
             )
@@ -875,28 +869,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     for i in range(len(object_anchor_keys))
                 ]
             else:
-                page_exists = [False] * kv_pages
-            boundary = 0
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    object_boundary = page_exists.index(False)
-                except ValueError:
-                    object_boundary = len(page_exists)
-                boundary = min(final_pages, object_boundary * coverage)
-                if coverage > 1:
-                    boundary -= boundary % coverage
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(final_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
-            if boundary:
-                hit_count[transfer.name] = boundary
-            final_pages = min(final_pages, boundary)
+                page_exists = [False] * len(object_anchor_keys)
+            successful_objects = (
+                page_exists.index(False) if False in page_exists else len(page_exists)
+            )
+            if successful_objects:
+                hit_count[transfer.name] = successful_objects
+            if logical_anchor or len(object_anchor_keys) != kv_pages:
+                if successful_objects != len(object_anchor_keys):
+                    final_pages = 0
+            elif transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                final_pages = min(final_pages, successful_objects)
+            elif not all(page_exists):
+                final_pages = 0
 
         return PoolTransferResult(final_pages, hit_count)
 
@@ -932,9 +917,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         f"K={len(ptr_list)}, scale={len(scale_ptrs)}."
                     )
                 ptr_list = [
-                    value
-                    for pair in zip(ptr_list, scale_ptrs)
-                    for value in pair
+                    value for pair in zip(ptr_list, scale_ptrs) for value in pair
                 ]
                 element_size_list = [
                     value
@@ -945,9 +928,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
                 )
-            if not (
-                len(key_strs) == len(ptr_list) == len(element_size_list)
-            ):
+            if not (len(key_strs) == len(ptr_list) == len(element_size_list)):
                 raise ValueError(
                     f"Mooncake transfer {transfer.name} physical object mismatch: "
                     f"keys={len(key_strs)}, ptrs={len(ptr_list)}, "
