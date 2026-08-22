@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -377,6 +378,15 @@ class C128SidecarComponent(TreeComponent):
             )
         return slot_page_size, group_tokens, group_tokens // anchor_page_size
 
+    def align_storage_prefetch_length(
+        self, node: UnifiedTreeNode, prefetch_tokens: int
+    ) -> int:
+        """Keep L3 recovery on complete absolute C128 group boundaries."""
+        _, group_tokens, _ = self._storage_geometry()
+        if self._node_depth(node) % group_tokens != 0:
+            return 0
+        return prefetch_tokens - prefetch_tokens % group_tokens
+
     def prepare_prefetch(
         self,
         node_id,
@@ -392,9 +402,7 @@ class C128SidecarComponent(TreeComponent):
             # A non-None empty tensor still builds a C128 transfer. Its exists
             # result clamps a sub-group L3 prefix to zero instead of falsely
             # publishing FULL/C4 data without the required C128 representation.
-            return PreparePrefetchResult(
-                host_indices=torch.empty(0, dtype=torch.int64)
-            )
+            return PreparePrefetchResult(host_indices=torch.empty(0, dtype=torch.int64))
         host_indices = self._c128_kv_pool_host.alloc(need_slots)
         if host_indices is None:
             self.cache.evict_host(need_slots * 128, ComponentType.FULL)
@@ -508,7 +516,6 @@ class C128SidecarComponent(TreeComponent):
                     host_indices=host_value,
                     keys=keys,
                     indices_from_pool=None,
-                    anchor_pages_per_key=coverage,
                     nodes_to_load=[node.id],
                 )
             ]
@@ -522,13 +529,29 @@ class C128SidecarComponent(TreeComponent):
                 )
             groups = host_indices.numel() // page_size
             _, _, coverage = self._storage_geometry()
+            hashes = get_hash_str(
+                list(token_ids or []), last_hash, page_size=self.tree_core.page_size
+            )
+            if not isinstance(hashes, list):
+                raise TypeError("C128 storage prefetch requires page hash values.")
+            if len(hashes) != prefetch_tokens // self.tree_core.page_size:
+                raise ValueError(
+                    "C128 prefetch hash/token cardinality mismatch: "
+                    f"hashes={len(hashes)}, prefetch_tokens={prefetch_tokens}, "
+                    f"anchor_page_size={self.tree_core.page_size}."
+                )
+            keys = [hashes[i - 1] for i in range(coverage, len(hashes) + 1, coverage)]
+            if len(keys) != groups:
+                raise ValueError(
+                    "C128 prefetch key/host-group cardinality mismatch: "
+                    f"keys={len(keys)}, groups={groups}."
+                )
             return [
                 PoolTransfer(
                     name=PoolName.DEEPSEEK_V4_C128,
                     host_indices=host_indices,
-                    keys=["__placeholder__"] * groups,
+                    keys=keys,
                     indices_from_pool=None,
-                    anchor_pages_per_key=coverage,
                 )
             ]
 
@@ -596,9 +619,7 @@ class C128SidecarComponent(TreeComponent):
                 else 0
             )
             required_groups = (
-                host_indices.numel() // page_size
-                if host_indices is not None
-                else 0
+                host_indices.numel() // page_size if host_indices is not None else 0
             )
             target = (
                 self.tree_core.node_by_id(insert_result.inserted_host_node)

@@ -107,17 +107,6 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
-    # Number of FULL-anchor pages represented by one storage key/object.
-    # Most pools are one-to-one. NPU DSV4 C128 is group based (for example,
-    # 16 FULL pages per object with global_page_size=128 and c128_page_size=16).
-    anchor_pages_per_key: int = 1
-
-    def __post_init__(self) -> None:
-        if self.anchor_pages_per_key <= 0:
-            raise ValueError(
-                "PoolTransfer.anchor_pages_per_key must be positive, "
-                f"got {self.anchor_pages_per_key} for {self.name}."
-            )
 
 
 @dataclass(frozen=True)
@@ -372,7 +361,6 @@ class MetadataCache:
 
 
 class HiCacheFile(HiCacheStorage):
-
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
