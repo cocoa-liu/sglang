@@ -144,19 +144,67 @@ class C128SidecarComponent(TreeComponent):
             return result
 
         pages = self._collect_device_pages(result.best_match_node)
+        root = self.tree_core.root_node
+        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
+        # The scheduler's device prefix after init_load_back is the original
+        # device_indices PLUS the FULL device values on [best_match_node,
+        # last_device_node) (rebuild via collect_full_device_indices). The SWA
+        # device-only validator can gate device_indices to fewer groups than the
+        # FULL device coverage (SWA is evicted independently of FULL), so the
+        # expected C128 page count must use that reconstructed coverage, not
+        # device_indices alone (which is 0 in that mixed state).
+        # Accumulate raw tokens first, divide once at the end (a premature
+        # `// group_tokens` then a raw-token addition mixes units and a second
+        # division double-floors the result).
+        expected_tokens = len(result.device_indices)
+        n = self.tree_core.node_by_id(result.best_match_node)
+        stop = self.tree_core.node_by_id(result.last_device_node)
+        while n is not stop and n is not root:
+            fv = n.component_data[BASE_COMPONENT_TYPE].value
+            if fv is not None:
+                expected_tokens += len(fv)
+            n = n.parent
+        expected = expected_tokens // group_tokens
+        assert pages.numel() == expected, (
+            f"c128 pages={pages.numel()} != expected={expected} "
+            f"(best_match={result.best_match_node} "
+            f"last_device={result.last_device_node} "
+            f"dev_indices_len={len(result.device_indices)})"
+        )
         self.cache.req_to_token_pool.set_c128_prefix_pages(req, pages)
         return result
 
+    def prepare_load_back(
+        self,
+        node_id: int,
+        *,
+        req: Optional[Req] = None,
+    ) -> PrepareLoadBackResult:
+        # match_prefix runs before H->D and therefore can only bind the C128
+        # pages that were already device-resident. Remember the anchor so the
+        # successful load-back can replace that provisional mapping.
+        return PrepareLoadBackResult(
+            anchor_node_id=node_id if req is not None else None
+        )
+
     def finalize_load_back(
-        self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
+        self,
+        req: Optional[Req],
+        prep: PrepareLoadBackResult,
+        success: bool,
     ) -> None:
-        if not success or req is None:
+        if not success or req is None or prep.anchor_node_id is None:
             return
 
-        # match_prefix runs before load-back, so a host-only C128 endpoint is
-        # absent from the request-local page table built by the match finalizer.
-        # Refresh it after commit_load_back attaches the restored page to the tree.
-        pages = self._collect_device_pages(req.best_match_node)
+        pages = self._collect_device_pages(prep.anchor_node_id)
+        _, group_tokens, _ = self._storage_geometry()
+        expected = self._node_depth(
+            self.tree_core.node_by_id(prep.anchor_node_id)
+        ) // group_tokens
+        assert pages.numel() == expected, (
+            f"c128 load-back pages={pages.numel()} != expected={expected} "
+            f"(anchor={prep.anchor_node_id})"
+        )
         self.cache.req_to_token_pool.set_c128_prefix_pages(req, pages)
 
     def recover_after_unevict(

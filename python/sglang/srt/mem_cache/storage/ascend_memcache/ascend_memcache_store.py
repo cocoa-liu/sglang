@@ -10,8 +10,10 @@ It follows the same HiCacheStorage contract and key layout strategy, while using
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -164,6 +166,9 @@ class AscendMemcacheStore(HiCacheStorage):
     ):
         self.store = None
         self.storage_config = storage_config
+        self._store_initialized = False
+        self._store_init_lock = threading.Lock()
+        self._pending_buffers: List[Tuple[int, int]] = []
 
         try:
             from memcache_hybrid import DistributedObjectStore, LocalConfig
@@ -183,23 +188,17 @@ class AscendMemcacheStore(HiCacheStorage):
                     "Ignoring unknown Memcache LocalConfig keys: %s", unknown_fields
                 )
 
-            self.store = DistributedObjectStore()
-            if self.store.setup(local_cfg) != 0:
-                raise RuntimeError(
-                    "memcache_hybrid.DistributedObjectStore.setup failed"
-                )
-
             ctrl = config.ctrl
             device_id = _resolve_memcache_device_id(ctrl, storage_config)
             init_bm = bool(ctrl.get("init_bm", True))
-            if self.store.init(device_id, init_bm) != 0:
-                raise RuntimeError("memcache_hybrid.DistributedObjectStore.init failed")
-            tp_rank = storage_config.tp_rank if storage_config is not None else 0
-            logger.info(
-                "Ascend memcache store initialized (tp_rank=%s, device_id=%s, init_bm=%s)",
-                tp_rank,
-                device_id,
-                init_bm,
+            self._store_factory = DistributedObjectStore
+            self._local_cfg = local_cfg
+            self._device_id = device_id
+            self._init_bm = init_bm
+            self._lazy_init = self._should_lazy_init(
+                mem_pool=mem_pool,
+                protocol=getattr(local_cfg, "protocol", None),
+                init_bm=init_bm,
             )
 
             self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
@@ -208,8 +207,18 @@ class AscendMemcacheStore(HiCacheStorage):
             self._check_server_enabled = bool(ctrl.get("check_server", False))
             self.extra_backend_tag = ctrl.get("extra_backend_tag")
 
+            self._init_runtime_fields(storage_config)
+
             if self._check_server_enabled:
                 self.check_server()
+
+            if self._lazy_init:
+                logger.info(
+                    "Delay Ascend memcache BM/HYBM initialization until the first "
+                    "DSV4 L3 write (protocol=device_sdma)."
+                )
+            else:
+                self._ensure_initialized()
 
             if not init_bm:
                 logger.info(
@@ -221,14 +230,83 @@ class AscendMemcacheStore(HiCacheStorage):
                     f"({envs.SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP.name}=0). "
                     "Set it to true to run the register-time warmup probe."
                 )
-            self._init_runtime_fields(storage_config)
-
         except ValueError as e:
             logger.error("Ascend Memcache configuration failed: %s", e)
             raise
         except Exception as exc:
             logger.error("Ascend Memcache store initialization failed: %s", exc)
             raise
+
+    @staticmethod
+    def _should_lazy_init(mem_pool: Any, protocol: Any, init_bm: bool) -> bool:
+        """Match vLLM's DSV4 device_sdma lifecycle without changing other models."""
+        if not init_bm or str(protocol).lower() != "device_sdma":
+            return False
+        dsv4_pools = {
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        }
+        return any(
+            getattr(entry, "name", None) in dsv4_pools
+            for entry in (getattr(mem_pool, "entries", None) or [])
+        )
+
+    def _is_store_initialized(self) -> bool:
+        # Keep helpers built with __new__ in focused unit tests compatible.
+        return getattr(self, "_store_initialized", self.store is not None)
+
+    def _register_buffer_meta(self, ptr: int, size: int) -> None:
+        ret_code = self.store.register_buffer(ptr, size)
+        if ret_code != 0:
+            logger.error("Failed to register buffer, error code: %s", ret_code)
+            raise RuntimeError(
+                f"Failed to register buffer to Ascend Memcache, error code: {ret_code}"
+            )
+
+    def _ensure_initialized(self) -> None:
+        """Initialize BM/HYBM once and then register every deferred host buffer."""
+        if self._is_store_initialized():
+            return
+        with self._store_init_lock:
+            if self._is_store_initialized():
+                return
+            store = self._store_factory()
+            try:
+                if store.setup(self._local_cfg) != 0:
+                    raise RuntimeError(
+                        "memcache_hybrid.DistributedObjectStore.setup failed"
+                    )
+                if store.init(self._device_id, self._init_bm) != 0:
+                    raise RuntimeError(
+                        "memcache_hybrid.DistributedObjectStore.init failed"
+                    )
+                self.store = store
+                for ptr, size in self._pending_buffers:
+                    self._register_buffer_meta(ptr, size)
+                self._store_initialized = True
+                self._pending_buffers.clear()
+            except Exception:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+                self.store = None
+                self._store_initialized = False
+                raise
+
+            tp_rank = self.storage_config.tp_rank if self.storage_config else 0
+            logger.info(
+                "Ascend memcache store initialized (tp_rank=%s, device_id=%s, "
+                "init_bm=%s, deferred=%s)",
+                tp_rank,
+                self._device_id,
+                self._init_bm,
+                getattr(self, "_lazy_init", False),
+            )
 
     def _init_runtime_fields(
         self, storage_config: Optional[HiCacheStorageConfig]
@@ -282,16 +360,20 @@ class AscendMemcacheStore(HiCacheStorage):
         self.backup_bandwidth = []
 
     def register_buffer(self, tensor: torch.Tensor):
-        if self.store is None:
-            raise RuntimeError("Ascend Memcache store is not initialized.")
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
-        ret_code = self.store.register_buffer(ptr, size)
-        if ret_code != 0:
-            logger.error(f"Failed to register buffer, error code: {ret_code}")
-            raise RuntimeError(
-                f"Failed to register buffer to Ascend Memcache, error code: {ret_code}"
-            )
+        if getattr(self, "_lazy_init", False):
+            # SGLang DSV4 L2 is NPU-pinned host memory. Its pointer falls in the
+            # NPU VA numeric range, so SmemBmRegisterUserMem misclassifies it as
+            # local HBM. Host H2G/G2H I/O does not require registration (matching
+            # MemCache's CPU tensor examples); registering it corrupts SDMA data.
+            return
+        if not self._is_store_initialized():
+            buffer_meta = (ptr, size)
+            if buffer_meta not in self._pending_buffers:
+                self._pending_buffers.append(buffer_meta)
+            return
+        self._register_buffer_meta(ptr, size)
 
     def check_server(self) -> None:
         url = self._memcache_metrics_url
@@ -397,6 +479,12 @@ class AscendMemcacheStore(HiCacheStorage):
         buf_list = host_pool.get_hybrid_pool_buffer()
         for buf in buf_list:
             self.register_buffer(buf)
+
+    def prepare_for_backup(self) -> None:
+        # DSV4 is TP-replicated, so non-zero TP ranks do not execute put(). They
+        # still need BM/HYBM ready for later L3 reads; the post-inference backup
+        # boundary initializes every rank without perturbing the first forward.
+        self._ensure_initialized()
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
@@ -536,9 +624,6 @@ class AscendMemcacheStore(HiCacheStorage):
                     f"len(keys)={len(keys)}, len(host_indices)={len(host_indices)}, page_size={page_size}."
                 )
 
-            ptr_list, element_size_list = self._get_transfer_buffer_meta(
-                host_pool, transfer, host_indices
-            )
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
@@ -547,6 +632,10 @@ class AscendMemcacheStore(HiCacheStorage):
                 raise ValueError(
                     f"Unsupported hybrid pool for Memcache: {transfer.name}"
                 )
+
+            ptr_list, element_size_list = self._get_transfer_buffer_meta(
+                host_pool, transfer, host_indices
+            )
             if not (len(key_strs) == len(ptr_list) == len(element_size_list)):
                 raise ValueError(
                     f"PoolTransfer '{transfer.name}' physical object mismatch: "
@@ -936,6 +1025,8 @@ class AscendMemcacheStore(HiCacheStorage):
         return len(query_keys) // key_multiplier
 
     def clear(self) -> None:
+        if not self._is_store_initialized():
+            return
         self.store.remove_all()
 
     def close(self) -> None:
@@ -946,22 +1037,44 @@ class AscendMemcacheStore(HiCacheStorage):
         except Exception as e:
             logger.warning("Ascend Memcache store.close failed: %s", e)
         self.store = None
+        self._store_initialized = False
 
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        raw = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        self._ensure_initialized()
+        io_ptrs = buffer_ptrs
+        staging_buffers = None
+        if getattr(self, "_lazy_init", False):
+            # torch_npu pinned-host allocations use an Ascend UVA address.  The
+            # address is CPU-accessible, but MemCache device_sdma does not handle
+            # it as ordinary MEDIA_DRAM reliably: the copy can return success
+            # while persisting unrelated bytes.  Copy each object to a regular
+            # process-DRAM buffer before H2G.  This is deliberately limited to
+            # the DSV4 device_sdma lifecycle selected by _should_lazy_init();
+            # existing MemCache paths retain their zero-copy behavior.
+            staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
+            for src, dst, size in zip(buffer_ptrs, io_ptrs, buffer_sizes):
+                ctypes.memmove(dst, src, size)
+        raw = self.store.batch_put_from(key_strs, io_ptrs, buffer_sizes)
         if len(raw) != len(key_strs):
             raise RuntimeError(
                 f"Memcache batch_put_from returned {len(raw)} results for "
                 f"{len(key_strs)} objects."
             )
-        return [int(code) for code in raw]
+        out = [int(code) for code in raw]
+        return out
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        if not self._is_store_initialized():
+            return [-1] * len(key_strs)
+        io_ptrs = buffer_ptrs
+        staging_buffers = None
+        if getattr(self, "_lazy_init", False):
+            staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
+        raw = self.store.batch_get_into(key_strs, io_ptrs, buffer_sizes)
         if len(raw) != len(key_strs):
             raise RuntimeError(
                 f"Memcache batch_get_into returned {len(raw)} results for "
@@ -970,17 +1083,29 @@ class AscendMemcacheStore(HiCacheStorage):
         # memcache_hybrid reports 0 on success, but HiCache read postprocess expects
         # positive values for success and negative values for failures.
         out: List[int] = []
-        for code, sz in zip(raw, buffer_sizes):
+        for i, (code, sz) in enumerate(zip(raw, buffer_sizes)):
             code = int(code)
             if code == 0:
+                if staging_buffers is not None:
+                    ctypes.memmove(buffer_ptrs[i], io_ptrs[i], sz)
                 out.append(int(sz))
             else:
                 out.append(-abs(code))
         return out
 
+    @staticmethod
+    def _make_dram_staging_buffers(
+        buffer_sizes: List[int],
+    ) -> Tuple[List[Any], List[int]]:
+        """Allocate ordinary process DRAM and keep it alive for one MemCache call."""
+        buffers = [ctypes.create_string_buffer(int(size)) for size in buffer_sizes]
+        return buffers, [ctypes.addressof(buffer) for buffer in buffers]
+
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         if not key_strs:
             return []
+        if not self._is_store_initialized():
+            return [0] * len(key_strs)
         raw = self.store.batch_is_exist(key_strs)
         if len(raw) != len(key_strs):
             raise RuntimeError(

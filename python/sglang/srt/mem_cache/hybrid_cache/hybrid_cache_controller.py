@@ -713,6 +713,11 @@ class HybridCacheController(BaseHiCacheController):
         return
 
     def _page_backup(self, operation):
+        # This point is reached after the request has produced cache data. It lets
+        # backends defer runtime-sensitive setup without moving model-specific
+        # lifecycle handling into the controller.
+        self.storage_backend.prepare_for_backup()
+
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [
