@@ -918,8 +918,15 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 state_tensor.shape[0], -1
             )
             usable_slots = (state_tensor.shape[0] // ring_size) * ring_size
+            page_offset = int(getattr(pool, "state_page_offset", 0))
+            first_slot = page_offset * ring_size
+            if first_slot >= usable_slots:
+                raise ValueError(
+                    f"{self.pool_name} state_page_offset={page_offset} leaves "
+                    "no transferable state pages"
+                )
             self.device_page_views.append(
-                state_bytes[:usable_slots].reshape(-1, state_page_bytes)
+                state_bytes[first_slot:usable_slots].reshape(-1, state_page_bytes)
             )
 
         self.ring_size = expected_ring_size or 0

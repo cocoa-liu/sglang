@@ -69,6 +69,8 @@ class PrepareLoadBackResult:
 
     # Freshly allocated device mamba slot, recovered on failure.
     allocated_mamba_slot: Optional[torch.Tensor] = None
+    # Optional component-local anchor needed to finalize a successful H->D.
+    anchor_node_id: Optional[NodeId] = None
 
 
 @dataclasses.dataclass(frozen=True)
