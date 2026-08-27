@@ -614,6 +614,10 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
+        if operation.pool_transfers:
+            self._trim_prefetch_transfers(
+                operation.pool_transfers, hash_value, kv_hit_pages
+            )
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
 
         return (
@@ -645,6 +649,7 @@ class HybridCacheController(BaseHiCacheController):
                         keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
                         indices_from_pool=transfer.indices_from_pool,
+                        logical_pages_per_object=transfer.logical_pages_per_object,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
@@ -687,13 +692,18 @@ class HybridCacheController(BaseHiCacheController):
         if not operation.is_terminated() and kv_completed_pages == len(
             operation.hash_value
         ):
-            # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
-            # Only handle non-KV-derived sidecar pools here.
-            transfers_nonkv = [
-                transfer
-                for transfer in operation.pool_transfers
-                if transfer.indices_from_pool != PoolName.KV
-            ]
+            # Physical anchors let the base controller batch KV-derived pools
+            # with KV. A logical DSV4 anchor has no primary I/O, so those pools
+            # must be resolved and fetched here as well.
+            transfers_nonkv = (
+                operation.pool_transfers
+                if getattr(self.mem_pool_host, "kv_buffer", None) is None
+                else [
+                    transfer
+                    for transfer in operation.pool_transfers
+                    if transfer.indices_from_pool != PoolName.KV
+                ]
+            )
             self._sync_trailing_keys(
                 transfers_nonkv, operation.hash_value, kv_completed_pages
             )
@@ -864,7 +874,59 @@ class HybridCacheController(BaseHiCacheController):
                 if transfer.keys is None:
                     transfer.keys = source.keys
             else:
-                pass
+                if transfer.name in (
+                    PoolName.DEEPSEEK_V4_C4,
+                    PoolName.DEEPSEEK_V4_C4_INDEXER,
+                ):
+                    entry = self.mem_pool_host.entry_map.get(transfer.name)
+                    if entry is None:
+                        raise RuntimeError(
+                            f"DSV4 storage pool is not registered: {transfer.name}."
+                        )
+                    transfer.host_indices = self._project_anchor_indices_for_storage(
+                        operation.host_indices,
+                        self.page_size,
+                        entry.host_pool.page_size,
+                    )
+                else:
+                    transfer.host_indices = operation.host_indices
+                if transfer.keys is None:
+                    transfer.keys = operation.hash_value
+
+    @staticmethod
+    def _project_anchor_indices_for_storage(
+        anchor_indices: torch.Tensor,
+        anchor_page_size: int,
+        target_page_size: int,
+    ) -> torch.Tensor:
+        """Project contiguous anchor pages to compact native side-pool pages."""
+        if anchor_page_size <= 0 or target_page_size <= 0:
+            raise ValueError("Storage page sizes must be positive.")
+        if anchor_indices.numel() % anchor_page_size != 0:
+            raise ValueError(
+                f"Anchor indices ({anchor_indices.numel()}) are not aligned to "
+                f"page size {anchor_page_size}."
+            )
+        if anchor_indices.numel() == 0:
+            return anchor_indices.new_empty((0,), dtype=torch.int64)
+        pages = anchor_indices.reshape(-1, anchor_page_size)
+        starts = pages[:, 0]
+        if torch.any(starts % anchor_page_size != 0):
+            raise ValueError("Anchor storage pages must start at a page boundary.")
+        expected = starts[:, None] + torch.arange(
+            anchor_page_size,
+            device=anchor_indices.device,
+            dtype=anchor_indices.dtype,
+        )
+        if not torch.equal(pages, expected):
+            raise ValueError("Anchor storage pages must contain contiguous indices.")
+        page_ids = starts // anchor_page_size
+        offsets = torch.arange(
+            target_page_size,
+            device=anchor_indices.device,
+            dtype=anchor_indices.dtype,
+        )
+        return (page_ids[:, None] * target_page_size + offsets).reshape(-1)
 
     def _sync_trailing_keys(
         self,
@@ -907,6 +969,42 @@ class HybridCacheController(BaseHiCacheController):
                     ]
                 )
                 transfer.host_indices = transfer.host_indices[:needed]
+
+    def _trim_prefetch_transfers(
+        self,
+        pool_transfers: list[PoolTransfer],
+        all_hashes: list[str],
+        kv_hit_pages: int,
+    ) -> None:
+        """Trim preallocated v2 buffers to the prefix selected by exists()."""
+        self._sync_trailing_keys(pool_transfers, all_hashes, kv_hit_pages)
+        for transfer in pool_transfers:
+            if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
+                continue
+            coverage = transfer.logical_pages_per_object
+            if coverage <= 0:
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' has invalid "
+                    f"logical_pages_per_object={coverage}."
+                )
+            keep_objects = kv_hit_pages // coverage
+            if transfer.keys is not None:
+                transfer.keys = transfer.keys[:keep_objects]
+
+            if transfer.indices_from_pool is not None or transfer.host_indices is None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                continue
+            keep_slots = keep_objects * entry.host_pool.page_size
+            tail = transfer.host_indices[keep_slots:]
+            transfer.host_indices = transfer.host_indices[:keep_slots]
+            if tail.numel() > 0:
+                self.append_host_mem_release(
+                    extra_pools=[
+                        PoolTransfer(name=transfer.name, host_indices=tail)
+                    ]
+                )
 
     def _apply_kv_anchor_ratio(
         self,

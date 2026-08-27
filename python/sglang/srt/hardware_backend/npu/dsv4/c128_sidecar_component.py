@@ -565,6 +565,7 @@ class C128SidecarComponent(TreeComponent):
                     keys=keys,
                     indices_from_pool=None,
                     nodes_to_load=[node.id],
+                    logical_pages_per_object=coverage,
                 )
             ]
 
@@ -600,6 +601,7 @@ class C128SidecarComponent(TreeComponent):
                     host_indices=host_indices,
                     keys=keys,
                     indices_from_pool=None,
+                    logical_pages_per_object=coverage,
                 )
             ]
 
