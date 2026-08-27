@@ -195,10 +195,17 @@ class AscendMemcacheStore(HiCacheStorage):
             self._local_cfg = local_cfg
             self._device_id = device_id
             self._init_bm = init_bm
-            self._lazy_init = self._should_lazy_init(
+            self._protocol = str(getattr(local_cfg, "protocol", "")).lower()
+            self._defer_runtime_init = self._should_lazy_init(
                 mem_pool=mem_pool,
-                protocol=getattr(local_cfg, "protocol", None),
+                protocol=self._protocol,
                 init_bm=init_bm,
+            )
+            # Runtime setup is deferred for both SDMA and RDMA. Only SDMA needs
+            # ordinary-DRAM staging for NPU-pinned host pointers; RDMA keeps its
+            # registerable HugeTLB-backed host buffers.
+            self._use_dram_staging = (
+                self._defer_runtime_init and self._protocol == "device_sdma"
             )
 
             self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
@@ -212,10 +219,11 @@ class AscendMemcacheStore(HiCacheStorage):
             if self._check_server_enabled:
                 self.check_server()
 
-            if self._lazy_init:
+            if self._defer_runtime_init:
                 logger.info(
                     "Delay Ascend memcache BM/HYBM initialization until the first "
-                    "DSV4 L3 write (protocol=device_sdma)."
+                    "DSV4 L3 write (protocol=%s).",
+                    self._protocol,
                 )
             else:
                 self._ensure_initialized()
@@ -239,8 +247,11 @@ class AscendMemcacheStore(HiCacheStorage):
 
     @staticmethod
     def _should_lazy_init(mem_pool: Any, protocol: Any, init_bm: bool) -> bool:
-        """Match vLLM's DSV4 device_sdma lifecycle without changing other models."""
-        if not init_bm or str(protocol).lower() != "device_sdma":
+        """Defer transport setup for DSV4 until after its first model forward."""
+        if not init_bm or str(protocol).lower() not in {
+            "device_sdma",
+            "device_rdma",
+        }:
             return False
         dsv4_pools = {
             PoolName.DEEPSEEK_V4_C4,
@@ -305,7 +316,7 @@ class AscendMemcacheStore(HiCacheStorage):
                 tp_rank,
                 self._device_id,
                 self._init_bm,
-                getattr(self, "_lazy_init", False),
+                getattr(self, "_defer_runtime_init", False),
             )
 
     def _init_runtime_fields(
@@ -362,7 +373,7 @@ class AscendMemcacheStore(HiCacheStorage):
     def register_buffer(self, tensor: torch.Tensor):
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
-        if getattr(self, "_lazy_init", False):
+        if getattr(self, "_use_dram_staging", False):
             # SGLang DSV4 L2 is NPU-pinned host memory. Its pointer falls in the
             # NPU VA numeric range, so SmemBmRegisterUserMem misclassifies it as
             # local HBM. Host H2G/G2H I/O does not require registration (matching
@@ -552,7 +563,21 @@ class AscendMemcacheStore(HiCacheStorage):
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
 
-        for transfer in pool_transfers or []:
+        transfers = pool_transfers or []
+        all_page_transfers = [
+            transfer
+            for transfer in transfers
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+        ]
+        trailing_transfers = [
+            transfer
+            for transfer in transfers
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+        ]
+
+        # Required prefix pools run first. Coarse objects report physical-object
+        # hits and convert them back to anchor/KV logical pages.
+        for transfer in all_page_transfers:
             if final_pages == 0:
                 break
             object_anchor_keys = (
@@ -584,14 +609,52 @@ class AscendMemcacheStore(HiCacheStorage):
             if successful_objects:
                 hit_count[transfer.name] = successful_objects
 
-            if logical_anchor or len(object_anchor_keys) != kv_pages:
-                # DSV4's logical anchor and coarse C128 objects are planned on a
-                # pre-aligned candidate. Every required object must be present.
-                if successful_objects != len(object_anchor_keys):
-                    final_pages = 0
-            elif transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                final_pages = min(final_pages, successful_objects)
-            elif not all(page_exists):
+            coverage = transfer.logical_pages_per_object
+            if coverage <= 0:
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' has invalid "
+                    f"logical_pages_per_object={coverage}."
+                )
+            final_pages = min(final_pages, successful_objects * coverage)
+
+        # The usable prefix must end at every coarse pool's object boundary.
+        for transfer in all_page_transfers:
+            coverage = transfer.logical_pages_per_object
+            final_pages -= final_pages % coverage
+
+        # Window/state pools use the tail of the prefix selected above, not the
+        # tail of the original request, which may already have diverged.
+        for transfer in trailing_transfers:
+            if final_pages == 0:
+                break
+            trailing_n = len(transfer.keys) if transfer.keys else 1
+            if final_pages < trailing_n:
+                final_pages = 0
+                break
+            transfer.keys = list(keys[final_pages - trailing_n : final_pages])
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                transfer.keys, transfer
+            )
+            ex = self._batch_exist(self._tag_keys(component_keys))
+            page_exists = (
+                [
+                    all(
+                        result == 1
+                        for result in ex[
+                            index * key_multiplier : (index + 1) * key_multiplier
+                        ]
+                    )
+                    for index in range(len(transfer.keys))
+                ]
+                if key_multiplier > 0
+                else [False] * len(transfer.keys)
+            )
+            successful_objects = (
+                page_exists.index(False) if False in page_exists else len(page_exists)
+            )
+            if successful_objects:
+                hit_count[transfer.name] = successful_objects
+            if successful_objects != len(transfer.keys):
                 final_pages = 0
 
         return PoolTransferResult(final_pages, hit_count)
@@ -1045,14 +1108,14 @@ class AscendMemcacheStore(HiCacheStorage):
         self._ensure_initialized()
         io_ptrs = buffer_ptrs
         staging_buffers = None
-        if getattr(self, "_lazy_init", False):
+        if getattr(self, "_use_dram_staging", False):
             # torch_npu pinned-host allocations use an Ascend UVA address.  The
             # address is CPU-accessible, but MemCache device_sdma does not handle
             # it as ordinary MEDIA_DRAM reliably: the copy can return success
             # while persisting unrelated bytes.  Copy each object to a regular
             # process-DRAM buffer before H2G.  This is deliberately limited to
-            # the DSV4 device_sdma lifecycle selected by _should_lazy_init();
-            # existing MemCache paths retain their zero-copy behavior.
+            # the DSV4 device_sdma path; device_rdma retains its registered
+            # HugeTLB zero-copy behavior even though runtime init is deferred.
             staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
             for src, dst, size in zip(buffer_ptrs, io_ptrs, buffer_sizes):
                 ctypes.memmove(dst, src, size)
@@ -1072,7 +1135,7 @@ class AscendMemcacheStore(HiCacheStorage):
             return [-1] * len(key_strs)
         io_ptrs = buffer_ptrs
         staging_buffers = None
-        if getattr(self, "_lazy_init", False):
+        if getattr(self, "_use_dram_staging", False):
             staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
         raw = self.store.batch_get_into(key_strs, io_ptrs, buffer_sizes)
         if len(raw) != len(key_strs):
