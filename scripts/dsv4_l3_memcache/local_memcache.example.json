@@ -1,0 +1,16 @@
+{
+  "meta_service_url": "tcp://127.0.0.1:5000",
+  "config_store_url": "tcp://127.0.0.1:6000",
+  "log_level": "info",
+  "world_size": 17,
+  "protocol": "device_sdma",
+  "dram_size": "0GB",
+  "hbm_size": "0",
+  "max_dram_size": "600GB",
+  "max_hbm_size": "0",
+  "client_timeout_seconds": 600,
+  "init_bm": true,
+  "check_server": true,
+  "metrics_url": "http://127.0.0.1:8000/health",
+  "extra_backend_tag": "dsv4_l3_local"
+}

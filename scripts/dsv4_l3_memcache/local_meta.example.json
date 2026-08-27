@@ -1,0 +1,9 @@
+{
+  "meta_service_url": "tcp://127.0.0.1:5000",
+  "config_store_url": "tcp://127.0.0.1:6000",
+  "metrics_url": "http://127.0.0.1:8000",
+  "log_level": "info",
+  "log_path": "/tmp/dsv4-l3-memcache-meta",
+  "evict_threshold_high": 95,
+  "evict_threshold_low": 90
+}
