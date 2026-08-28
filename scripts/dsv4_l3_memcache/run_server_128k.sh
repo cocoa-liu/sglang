@@ -1,6 +1,9 @@
 #!/bin/bash
 
 set -e
+# CANN vendor environment scripts read optional variables without defaults.
+# Disable nounset explicitly because it may be inherited through SHELLOPTS.
+set +u
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SGLANG_DIR=${SGLANG_DIR:?set SGLANG_DIR to the lc-dsv4-l3 checkout}
@@ -18,9 +21,6 @@ RUN_E=$(cd "$RUN_E" && pwd)
 
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
-# The vendor environment scripts read optional variables before defining them,
-# so enable nounset only after both scripts have been sourced.
-set -u
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export PYTHONPATH=$SGLANG_DIR/python:/sgl-workspace/sglang/python:${PYTHONPATH:-}
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
