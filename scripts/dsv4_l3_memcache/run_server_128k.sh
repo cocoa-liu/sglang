@@ -19,6 +19,10 @@ RUN_E=${1:?usage: run_server_128k.sh RESULT_DIR}
 mkdir -p "$RUN_E"
 RUN_E=$(cd "$RUN_E" && pwd)
 
+# CANN appends each vendor OPP directory to this optional search path. Define
+# the empty starting value explicitly for vendor scripts that expand it without
+# a default while nounset is enabled by the parent environment.
+export ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH:-}
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
