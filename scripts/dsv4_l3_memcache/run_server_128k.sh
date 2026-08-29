@@ -35,6 +35,11 @@ export HCCL_SOCKET_IFNAME=lo
 export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DSV4_FP4_EXPERTS=False
+# Structured startup/forward/L3 diagnostics are part of this validation tool.
+# Keep device synchronization off for the first run because it changes timing.
+export SGLANG_DSV4_L3_DIAGNOSTICS=${SGLANG_DSV4_L3_DIAGNOSTICS:-1}
+export SGLANG_DSV4_L3_DIAGNOSTICS_STALL_TIMEOUT=${SGLANG_DSV4_L3_DIAGNOSTICS_STALL_TIMEOUT:-60}
+export SGLANG_DSV4_L3_DIAGNOSTICS_SYNC=${SGLANG_DSV4_L3_DIAGNOSTICS_SYNC:-0}
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch

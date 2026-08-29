@@ -113,6 +113,31 @@ bash "$TOOLS_DIR/run_server_128k.sh" "$RESULT_DIR/server"
 tail -f "$RESULT_DIR/server/server.log"
 ```
 
+The script enables structured DSV4 L3 diagnostics by default. Every record is
+prefixed with `[DSV4_L3_DIAG]`; a forward or MemCache call blocked for 60 seconds
+also dumps all Python thread stacks into `server.log`. The first run does not
+force NPU synchronization, so it preserves the original execution timing.
+
+After a failure, collect the compact timeline and the surrounding stack dumps:
+
+```bash
+grep -n 'DSV4_L3_DIAG' "$RESULT_DIR/server/server.log" \
+  >"$RESULT_DIR/server/dsv4-l3-diag.log"
+grep -nE 'DSV4_L3_DIAG|Current thread|Thread 0x|507014|507015|AICore|Traceback' \
+  "$RESULT_DIR/server/server.log" | tail -n 2000
+```
+
+Only if the first diagnostic run reaches a DeepEP boundary but cannot identify
+which previously queued NPU operation failed, rerun with the intrusive sync
+probe enabled:
+
+```bash
+SGLANG_DSV4_L3_DIAGNOSTICS_SYNC=1 \
+  bash "$TOOLS_DIR/run_server_128k.sh" "$RESULT_DIR/server-sync"
+```
+
+Do not use sync-mode throughput or latency as performance results.
+
 Do not start another SGLang service on the same 16 devices. Wait for the server
 health endpoint before sending the 128K workload:
 
