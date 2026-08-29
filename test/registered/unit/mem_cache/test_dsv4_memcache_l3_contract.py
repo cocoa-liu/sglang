@@ -507,6 +507,59 @@ def test_virtual_anchor_prefetch_skips_primary_io_and_loads_real_pool():
     )
 
 
+class _OneIterationStopEvent:
+    def __init__(self):
+        self._checks = 0
+
+    def is_set(self):
+        self._checks += 1
+        return self._checks > 1
+
+
+def _run_one_hybrid_prefetch_worker(page_transfer):
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.storage_stop_event = _OneIterationStopEvent()
+    controller.prefetch_buffer = Queue()
+    controller.prefetch_sync_queue = Queue()
+    controller._page_transfer = page_transfer
+    controller.append_host_mem_release = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("the scheduler, not the IO worker, owns prefetch release")
+    )
+
+    operation = PrefetchOperation("req-terminal", list(range(128)))
+    operation.host_indices = torch.arange(128)
+    controller.prefetch_buffer.put(operation)
+    controller.prefetch_io_aux_func()
+
+    acks = []
+    while not controller.prefetch_sync_queue.empty():
+        acks.append(controller.prefetch_sync_queue.get())
+    return operation, acks
+
+
+def test_hybrid_prefetch_worker_emits_terminal_ack_on_success():
+    operation, acks = _run_one_hybrid_prefetch_worker(lambda _operation: None)
+
+    assert len(acks) == 1
+    assert acks[0].operation is operation
+    assert acks[0].rid == operation.request_id
+    assert acks[0].completed_req is True
+    assert not operation.is_terminated()
+
+
+def test_hybrid_prefetch_worker_emits_terminal_ack_on_failure():
+    def fail_transfer(_operation):
+        raise RuntimeError("injected prefetch failure")
+
+    operation, acks = _run_one_hybrid_prefetch_worker(fail_transfer)
+
+    assert len(acks) == 1
+    assert acks[0].operation is operation
+    assert acks[0].completed_req is True
+    assert operation.is_terminated()
+    assert operation.pool_transfers_done is True
+
+
 def test_c128_prefetch_transfer_uses_runtime_coverage():
     component = C128SidecarComponent.__new__(C128SidecarComponent)
     component.cache = SimpleNamespace(
