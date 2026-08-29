@@ -32,11 +32,6 @@ from sglang.srt.configs.model_config import (
     ModelImpl,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
-from sglang.srt.debug_utils.dsv4_l3_diagnostics import (
-    diagnostic_method,
-    diagnostic_runtime_snapshot,
-    forward_batch_metadata,
-)
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -1565,12 +1560,6 @@ class ModelRunner:
         forward_batch.split_index = next_split_index
         return ret
 
-    @diagnostic_method(
-        "model_runner.forward",
-        argument_index=1,
-        argument_name="forward_batch",
-        metadata_fn=forward_batch_metadata,
-    )
     def forward(
         self,
         forward_batch: ForwardBatch,
@@ -1579,7 +1568,6 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        diagnostic_runtime_snapshot(logger, "model_runner")
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 

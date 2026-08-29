@@ -451,12 +451,6 @@ class Envs:
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
-    # Opt-in end-to-end diagnostics for DSV4 + HiCache L3 startup/forward stalls.
-    SGLANG_DSV4_L3_DIAGNOSTICS = EnvBool(False)
-    SGLANG_DSV4_L3_DIAGNOSTICS_STALL_TIMEOUT = EnvFloat(60.0)
-    # Device synchronization changes timing, so keep this second-level probe
-    # separate from the non-invasive diagnostic master switch.
-    SGLANG_DSV4_L3_DIAGNOSTICS_SYNC = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)

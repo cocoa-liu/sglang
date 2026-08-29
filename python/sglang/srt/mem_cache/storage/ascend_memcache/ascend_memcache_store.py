@@ -22,11 +22,6 @@ from typing import Any, List, Optional, Tuple
 import requests
 import torch
 
-from sglang.srt.debug_utils.dsv4_l3_diagnostics import (
-    diagnostic_log,
-    diagnostic_operation,
-    diagnostic_runtime_snapshot,
-)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
@@ -213,26 +208,6 @@ class AscendMemcacheStore(HiCacheStorage):
             self._use_dram_staging = (
                 self._defer_runtime_init and self._protocol == "device_sdma"
             )
-            diagnostic_runtime_snapshot(logger, "ascend_memcache")
-            diagnostic_log(
-                logger,
-                "memcache.lazy_init.decision",
-                mem_pool_type=type(mem_pool).__name__,
-                mem_pool_has_entries=hasattr(mem_pool, "entries"),
-                mem_pool_kv_buffer_is_none=(
-                    getattr(mem_pool, "kv_buffer", "missing") is None
-                ),
-                pool_names=[
-                    str(getattr(entry, "name", None))
-                    for entry in (getattr(mem_pool, "entries", None) or [])
-                ]
-                or list(getattr(storage_config, "host_pool_names", ()) or ()),
-                protocol=self._protocol,
-                init_bm=init_bm,
-                deferred=self._defer_runtime_init,
-                use_dram_staging=self._use_dram_staging,
-                device_id=device_id,
-            )
 
             self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
                 "memcache_metrics_url"
@@ -304,14 +279,7 @@ class AscendMemcacheStore(HiCacheStorage):
         return getattr(self, "_store_initialized", self.store is not None)
 
     def _register_buffer_meta(self, ptr: int, size: int) -> None:
-        with diagnostic_operation(
-            logger,
-            "memcache.register_buffer",
-            watchdog=True,
-            ptr=hex(ptr),
-            size_bytes=size,
-        ):
-            ret_code = self.store.register_buffer(ptr, size)
+        ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
             logger.error("Failed to register buffer, error code: %s", ret_code)
             raise RuntimeError(
@@ -327,28 +295,11 @@ class AscendMemcacheStore(HiCacheStorage):
                 return
             store = self._store_factory()
             try:
-                with diagnostic_operation(
-                    logger,
-                    "memcache.runtime.setup",
-                    watchdog=True,
-                    protocol=self._protocol,
-                    device_id=self._device_id,
-                ):
-                    setup_result = store.setup(self._local_cfg)
-                if setup_result != 0:
+                if store.setup(self._local_cfg) != 0:
                     raise RuntimeError(
                         "memcache_hybrid.DistributedObjectStore.setup failed"
                     )
-                with diagnostic_operation(
-                    logger,
-                    "memcache.runtime.init",
-                    watchdog=True,
-                    protocol=self._protocol,
-                    device_id=self._device_id,
-                    init_bm=self._init_bm,
-                ):
-                    init_result = store.init(self._device_id, self._init_bm)
-                if init_result != 0:
+                if store.init(self._device_id, self._init_bm) != 0:
                     raise RuntimeError(
                         "memcache_hybrid.DistributedObjectStore.init failed"
                     )
@@ -435,28 +386,11 @@ class AscendMemcacheStore(HiCacheStorage):
             # NPU VA numeric range, so SmemBmRegisterUserMem misclassifies it as
             # local HBM. Host H2G/G2H I/O does not require registration (matching
             # MemCache's CPU tensor examples); registering it corrupts SDMA data.
-            diagnostic_log(
-                logger,
-                "memcache.buffer_registration.skipped_for_staging",
-                ptr=hex(ptr),
-                size_bytes=size,
-                tensor_shape=list(tensor.shape),
-                tensor_dtype=str(tensor.dtype),
-            )
             return
         if not self._is_store_initialized():
             buffer_meta = (ptr, size)
             if buffer_meta not in self._pending_buffers:
                 self._pending_buffers.append(buffer_meta)
-            diagnostic_log(
-                logger,
-                "memcache.buffer_registration.deferred",
-                ptr=hex(ptr),
-                size_bytes=size,
-                pending_count=len(self._pending_buffers),
-                tensor_shape=list(tensor.shape),
-                tensor_dtype=str(tensor.dtype),
-            )
             return
         self._register_buffer_meta(ptr, size)
 
@@ -506,14 +440,6 @@ class AscendMemcacheStore(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
-        diagnostic_log(
-            logger,
-            "memcache.pool.register_anchor",
-            pool_type=type(mem_pool_host).__name__,
-            layout=getattr(mem_pool_host, "layout", None),
-            page_size=getattr(mem_pool_host, "page_size", None),
-            logical_anchor=getattr(mem_pool_host, "kv_buffer", None) is None,
-        )
         # DSV4 FULL is a logical anchor. It owns hashes/slots but no payload.
         if self.mem_pool_host.kv_buffer is None:
             self.gb_per_page = 0.0
@@ -552,15 +478,6 @@ class AscendMemcacheStore(HiCacheStorage):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
-        diagnostic_log(
-            logger,
-            "memcache.pool.register_sidecar",
-            pool_name=str(host_pool_name),
-            pool_type=type(host_pool).__name__,
-            layout=getattr(host_pool, "layout", None),
-            page_size=getattr(host_pool, "page_size", None),
-            size=getattr(host_pool, "size", None),
-        )
         layout = getattr(host_pool, "layout", None)
         if layout not in {
             "page_first",
@@ -586,13 +503,7 @@ class AscendMemcacheStore(HiCacheStorage):
         # DSV4 is TP-replicated, so non-zero TP ranks do not execute put(). They
         # still need BM/HYBM ready for later L3 reads; the post-inference backup
         # boundary initializes every rank without perturbing the first forward.
-        with diagnostic_operation(
-            logger,
-            "memcache.prepare_for_backup",
-            initialized=self._is_store_initialized(),
-            deferred=getattr(self, "_defer_runtime_init", False),
-        ):
-            self._ensure_initialized()
+        self._ensure_initialized()
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
@@ -650,20 +561,6 @@ class AscendMemcacheStore(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        diagnostic_log(
-            logger,
-            "memcache.batch_exists_v2.begin",
-            key_count=len(keys),
-            transfers=[
-                {
-                    "name": str(transfer.name),
-                    "key_count": len(transfer.keys or []),
-                    "hit_policy": str(transfer.hit_policy),
-                    "logical_pages_per_object": transfer.logical_pages_per_object,
-                }
-                for transfer in (pool_transfers or [])
-            ],
-        )
         logical_anchor = getattr(self.mem_pool_host, "kv_buffer", None) is None
         if logical_anchor:
             # Logical anchor: required physical pools decide the usable prefix.
@@ -768,15 +665,7 @@ class AscendMemcacheStore(HiCacheStorage):
             if successful_objects != len(transfer.keys):
                 final_pages = 0
 
-        result = PoolTransferResult(final_pages, hit_count)
-        diagnostic_log(
-            logger,
-            "memcache.batch_exists_v2.end",
-            key_count=len(keys),
-            kv_hit_pages=result.kv_hit_pages,
-            extra_pool_hit_pages=result.extra_pool_hit_pages,
-        )
-        return result
+        return PoolTransferResult(final_pages, hit_count)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
@@ -879,28 +768,14 @@ class AscendMemcacheStore(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        with diagnostic_operation(
-            logger,
-            "memcache.batch_get_v2",
-            transfer_count=len(transfers),
-            pools=[str(transfer.name) for transfer in transfers],
-            key_counts=[len(transfer.keys or []) for transfer in transfers],
-        ):
-            return self._batch_io_v2(transfers, is_set=False)
+        return self._batch_io_v2(transfers, is_set=False)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        with diagnostic_operation(
-            logger,
-            "memcache.batch_set_v2",
-            transfer_count=len(transfers),
-            pools=[str(transfer.name) for transfer in transfers],
-            key_counts=[len(transfer.keys or []) for transfer in transfers],
-        ):
-            return self._batch_io_v2(transfers, is_set=True)
+        return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1252,15 +1127,7 @@ class AscendMemcacheStore(HiCacheStorage):
             staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
             for src, dst, size in zip(buffer_ptrs, io_ptrs, buffer_sizes):
                 ctypes.memmove(dst, src, size)
-        with diagnostic_operation(
-            logger,
-            "memcache.batch_put_from",
-            watchdog=True,
-            object_count=len(key_strs),
-            total_bytes=sum(buffer_sizes),
-            use_dram_staging=getattr(self, "_use_dram_staging", False),
-        ):
-            raw = self.store.batch_put_from(key_strs, io_ptrs, buffer_sizes)
+        raw = self.store.batch_put_from(key_strs, io_ptrs, buffer_sizes)
         if len(raw) != len(key_strs):
             raise RuntimeError(
                 f"Memcache batch_put_from returned {len(raw)} results for "
@@ -1278,15 +1145,7 @@ class AscendMemcacheStore(HiCacheStorage):
         staging_buffers = None
         if getattr(self, "_use_dram_staging", False):
             staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
-        with diagnostic_operation(
-            logger,
-            "memcache.batch_get_into",
-            watchdog=True,
-            object_count=len(key_strs),
-            total_bytes=sum(buffer_sizes),
-            use_dram_staging=getattr(self, "_use_dram_staging", False),
-        ):
-            raw = self.store.batch_get_into(key_strs, io_ptrs, buffer_sizes)
+        raw = self.store.batch_get_into(key_strs, io_ptrs, buffer_sizes)
         if len(raw) != len(key_strs):
             raise RuntimeError(
                 f"Memcache batch_get_into returned {len(raw)} results for "

@@ -26,11 +26,6 @@ import psutil
 import setproctitle
 import zmq
 
-from sglang.srt.debug_utils.dsv4_l3_diagnostics import (
-    diagnostic_log,
-    diagnostic_runtime_snapshot,
-    request_metadata,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -222,7 +217,6 @@ class DataParallelController:
             self.control_message_step = 1
 
         self.init_dispatcher()
-        diagnostic_runtime_snapshot(logger, "data_parallel_controller")
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DataParallelController",
@@ -338,12 +332,6 @@ class DataParallelController:
 
         time_stats.set_dp_dispatch_time()
         req.time_stats = wrap_as_pickle(time_stats)
-        diagnostic_log(
-            logger,
-            "dp.dispatch.request",
-            load_balance_method=self.load_balance_method.name,
-            **request_metadata(req),
-        )
         self.dispatching(req)
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
@@ -774,13 +762,6 @@ class DataParallelController:
             ):
                 raise ValueError(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
-            diagnostic_log(
-                logger,
-                "dp.dispatch.selected",
-                target_dp_rank=rank,
-                routing="direct",
-                **request_metadata(req),
-            )
             sock_send(self.workers[rank], req)
             return True
         return False
@@ -798,13 +779,6 @@ class DataParallelController:
             self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
             if self.status[slot]:
                 logger.debug(f"Choose worker {slot}")
-                diagnostic_log(
-                    logger,
-                    "dp.dispatch.selected",
-                    target_dp_rank=slot,
-                    routing="round_robin",
-                    **request_metadata(req),
-                )
                 sock_send(self.workers[slot], req)
                 return
             attempts += 1
@@ -822,26 +796,12 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        diagnostic_log(
-            logger,
-            "dp.dispatch.selected",
-            target_dp_rank=target_rank,
-            routing="bootstrap_room",
-            **request_metadata(req),
-        )
         sock_send(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        diagnostic_log(
-            logger,
-            "dp.dispatch.selected",
-            target_dp_rank=target_worker,
-            routing="total_requests",
-            **request_metadata(req),
-        )
         sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
@@ -850,13 +810,6 @@ class DataParallelController:
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
-        )
-        diagnostic_log(
-            logger,
-            "dp.dispatch.selected",
-            target_dp_rank=target_worker,
-            routing="total_tokens",
-            **request_metadata(req),
         )
         sock_send(self.workers[target_worker], req)
 
