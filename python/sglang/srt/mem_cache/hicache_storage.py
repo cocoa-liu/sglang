@@ -38,6 +38,10 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Storage backends are constructed with the logical anchor pool after the
+    # HostPoolGroup refactor. Preserve the complete pool composition for
+    # backends whose initialization lifecycle depends on sidecar pools.
+    host_pool_names: tuple[str, ...] = ()
 
 
 @dataclass

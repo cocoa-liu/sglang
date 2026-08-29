@@ -746,6 +746,10 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            host_pool_names=tuple(
+                str(entry.name)
+                for entry in (getattr(self.mem_pool_host, "entries", None) or [])
+            ),
         )
 
     def reset(self):

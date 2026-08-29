@@ -140,6 +140,58 @@ def test_device_transports_lazy_init_is_limited_to_dsv4_pool_groups():
     )
 
 
+def test_logical_anchor_uses_controller_pool_names_for_lazy_init():
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.mem_pool_device = object()
+    controller.mem_pool_host = SimpleNamespace(
+        layout="page_first_direct",
+        entries=[
+            SimpleNamespace(name=PoolName.KV),
+            SimpleNamespace(name=PoolName.DEEPSEEK_V4_C4),
+        ],
+    )
+    controller.enable_storage_metrics = False
+    controller.get_attn_cp_rank_and_size = lambda: (0, 1)
+
+    parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+    with (
+        patch(
+            "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.managers.cache_controller.get_parallel",
+            return_value=parallel,
+        ),
+    ):
+        storage_config = controller._generate_storage_config("dsv4", {})
+
+    logical_anchor = SimpleNamespace(kv_buffer=None)
+    assert storage_config.host_pool_names == (
+        str(PoolName.KV),
+        str(PoolName.DEEPSEEK_V4_C4),
+    )
+
+    assert AscendMemcacheStore._should_lazy_init(
+        logical_anchor,
+        "device_sdma",
+        True,
+        storage_config.host_pool_names,
+    )
+    assert AscendMemcacheStore._should_lazy_init(
+        logical_anchor,
+        "device_rdma",
+        True,
+        storage_config.host_pool_names,
+    )
+    assert not AscendMemcacheStore._should_lazy_init(
+        logical_anchor,
+        "host_shm",
+        True,
+        storage_config.host_pool_names,
+    )
+
+
 def test_lazy_store_reports_miss_and_skips_misclassified_host_registration():
     backend = _make_lazy_memcache()
     tensor = torch.empty(16, dtype=torch.uint8)

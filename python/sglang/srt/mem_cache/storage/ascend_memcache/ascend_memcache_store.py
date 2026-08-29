@@ -205,6 +205,7 @@ class AscendMemcacheStore(HiCacheStorage):
                 mem_pool=mem_pool,
                 protocol=self._protocol,
                 init_bm=init_bm,
+                host_pool_names=getattr(storage_config, "host_pool_names", ()),
             )
             # Runtime setup is deferred for both SDMA and RDMA. Only SDMA needs
             # ordinary-DRAM staging for NPU-pinned host pointers; RDMA keeps its
@@ -224,7 +225,8 @@ class AscendMemcacheStore(HiCacheStorage):
                 pool_names=[
                     str(getattr(entry, "name", None))
                     for entry in (getattr(mem_pool, "entries", None) or [])
-                ],
+                ]
+                or list(getattr(storage_config, "host_pool_names", ()) or ()),
                 protocol=self._protocol,
                 init_bm=init_bm,
                 deferred=self._defer_runtime_init,
@@ -270,25 +272,32 @@ class AscendMemcacheStore(HiCacheStorage):
             raise
 
     @staticmethod
-    def _should_lazy_init(mem_pool: Any, protocol: Any, init_bm: bool) -> bool:
+    def _should_lazy_init(
+        mem_pool: Any,
+        protocol: Any,
+        init_bm: bool,
+        host_pool_names: Any = (),
+    ) -> bool:
         """Defer transport setup for DSV4 until after its first model forward."""
         if not init_bm or str(protocol).lower() not in {
             "device_sdma",
             "device_rdma",
         }:
             return False
-        dsv4_pools = {
-            PoolName.DEEPSEEK_V4_C4,
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
-            PoolName.DEEPSEEK_V4_C128,
-            PoolName.DEEPSEEK_V4_C4_STATE,
-            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-            PoolName.DEEPSEEK_V4_C128_STATE,
+        dsv4_pool_names = {
+            str(PoolName.DEEPSEEK_V4_C4),
+            str(PoolName.DEEPSEEK_V4_C4_INDEXER),
+            str(PoolName.DEEPSEEK_V4_C128),
+            str(PoolName.DEEPSEEK_V4_C4_STATE),
+            str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
+            str(PoolName.DEEPSEEK_V4_C128_STATE),
         }
-        return any(
-            getattr(entry, "name", None) in dsv4_pools
+        actual_pool_names = {
+            str(getattr(entry, "name", ""))
             for entry in (getattr(mem_pool, "entries", None) or [])
-        )
+        }
+        actual_pool_names.update(str(name) for name in (host_pool_names or ()))
+        return not actual_pool_names.isdisjoint(dsv4_pool_names)
 
     def _is_store_initialized(self) -> bool:
         # Keep helpers built with __new__ in focused unit tests compatible.

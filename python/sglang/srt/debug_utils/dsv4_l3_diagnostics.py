@@ -174,13 +174,16 @@ def diagnostic_operation(
         def dump_if_stalled() -> None:
             if timeout <= 0 or done.wait(timeout):
                 return
+            stall_fields = dict(fields)
+            stall_fields.update(
+                elapsed_s=round(time.monotonic() - started, 3),
+                watchdog_timeout_s=timeout,
+            )
             diagnostic_log(
                 logger,
                 f"{event}.stall",
                 level=logging.ERROR,
-                elapsed_s=round(time.monotonic() - started, 3),
-                timeout_s=timeout,
-                **fields,
+                **stall_fields,
             )
             try:
                 faulthandler.dump_traceback(file=sys.stderr, all_threads=True)

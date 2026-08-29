@@ -83,6 +83,23 @@ def test_watchdog_dumps_python_threads(monkeypatch, caplog):
     assert '"event": "test.stall.stall"' in caplog.text
 
 
+def test_watchdog_accepts_operation_timeout_field(monkeypatch, caplog):
+    _enable(monkeypatch, stall_timeout=0.01)
+    monkeypatch.setattr(diag.faulthandler, "dump_traceback", lambda **kwargs: None)
+
+    with caplog.at_level(logging.INFO), diag.diagnostic_operation(
+        logging.getLogger(__name__),
+        "test.timeout_field",
+        watchdog=True,
+        timeout_s=600,
+    ):
+        time.sleep(0.05)
+
+    assert '"event": "test.timeout_field.stall"' in caplog.text
+    assert '"timeout_s": 600' in caplog.text
+    assert '"watchdog_timeout_s": 0.01' in caplog.text
+
+
 def test_metadata_helpers_do_not_read_tensor_values():
     tensor = SimpleNamespace(
         shape=(2, 4),
