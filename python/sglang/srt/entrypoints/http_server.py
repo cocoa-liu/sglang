@@ -66,6 +66,7 @@ from fastapi.routing import APIRoute
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.debug_utils.dsv4_l3_diagnostics import diagnostic_operation
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -2306,13 +2307,27 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if get_disagg().disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
-            )
+            effective_timeout = warmup_timeout if warmup_timeout > 0 else 600
+            with diagnostic_operation(
+                logger,
+                "http_server.warmup_request",
+                watchdog=True,
+                endpoint=request_name,
+                timeout_s=effective_timeout,
+                dp_size=get_parallel().config.dp_size,
+                prompt_count=(
+                    len(json_data.get("text", []))
+                    if isinstance(json_data.get("text"), list)
+                    else 1
+                ),
+            ):
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=effective_timeout,
+                    verify=ssl_verify,
+                )
             assert res.status_code == 200, f"{res.text}"
             # Skip server_status update for Rust server
             if not envs.SGLANG_RUST_SERVER.get():

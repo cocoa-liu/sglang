@@ -34,6 +34,12 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.debug_utils.dsv4_l3_diagnostics import (
+    diagnostic_layer,
+    diagnostic_operation,
+    diagnostics_enabled,
+    tensor_metadata,
+)
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
@@ -3122,11 +3128,23 @@ class DeepseekV4Model(nn.Module):
         if run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
-            hidden_states = self._forward_layers_tbo(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+            if diagnostics_enabled():
+                with diagnostic_operation(
+                    logger,
+                    "model.layers_tbo",
+                    hidden_states=tensor_metadata(hidden_states),
+                ):
+                    hidden_states = self._forward_layers_tbo(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                    )
+            else:
+                hidden_states = self._forward_layers_tbo(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
         else:
             use_fused = self.use_fused_mhc_post_pre
             prev_residual, prev_post, prev_comb = None, None, None
@@ -3139,17 +3157,30 @@ class DeepseekV4Model(nn.Module):
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
-                with ctx:
-                    hidden_states, prev_residual, prev_post, prev_comb = layer(
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        forward_batch=forward_batch,
-                        input_ids=input_ids,
-                        input_ids_global=input_ids_global,
-                        prev_residual=prev_residual,
-                        prev_post=prev_post,
-                        prev_comb=prev_comb,
-                    )
+                if diagnostics_enabled():
+                    with ctx, diagnostic_layer(logger, i, hidden_states):
+                        hidden_states, prev_residual, prev_post, prev_comb = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
+                        )
+                else:
+                    with ctx:
+                        hidden_states, prev_residual, prev_post, prev_comb = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
+                        )
                 if capture_dspark and i in self.dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(
@@ -3159,9 +3190,20 @@ class DeepseekV4Model(nn.Module):
                         completed = hidden_states
                     dspark_aux_hidden_states.append(completed.mean(dim=1))
             if use_fused and last_layer is not None:
-                hidden_states = last_layer.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
-                )
+                if diagnostics_enabled():
+                    with diagnostic_operation(
+                        logger,
+                        "model.trailing_hc_post",
+                        layer_id=self.end_layer - 1,
+                        hidden_states=tensor_metadata(hidden_states),
+                    ):
+                        hidden_states = last_layer.hc_post(
+                            hidden_states, prev_residual, prev_post, prev_comb
+                        )
+                else:
+                    hidden_states = last_layer.hc_post(
+                        hidden_states, prev_residual, prev_post, prev_comb
+                    )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if (

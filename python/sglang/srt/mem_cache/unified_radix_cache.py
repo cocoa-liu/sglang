@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, Type
 
 import torch
 
+from sglang.srt.debug_utils.dsv4_l3_diagnostics import diagnostic_log
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -35,6 +36,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
 )
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
@@ -1683,6 +1685,13 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
+            diagnostic_log(
+                logger,
+                "hicache.prefetch.declined",
+                rid=req_id,
+                reason="storage_disabled",
+                input_tokens=len(new_input_tokens),
+            )
             return
 
         buffer_mode = self.host_memory_mode == "buffer_only"
@@ -1711,15 +1720,38 @@ class UnifiedRadixCache(BasePrefixCache):
         if prefetch_length < self.prefetch_threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
+            diagnostic_log(
+                logger,
+                "hicache.prefetch.declined",
+                rid=req_id,
+                reason="below_threshold",
+                input_tokens=len(new_input_tokens),
+                aligned_prefetch_tokens=prefetch_length,
+                prefetch_threshold=self.prefetch_threshold,
+            )
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
+            diagnostic_log(
+                logger,
+                "hicache.prefetch.declined",
+                rid=req_id,
+                reason="rate_limited",
+                aligned_prefetch_tokens=prefetch_length,
+            )
             return
         if req_id in self.ongoing_prefetch or (
             buffer_mode and self.buffer_pipeline.has_staged(req_id)
         ):
             # A fetch (or an unconsumed hold) already exists for this rid;
             # overwriting would leak its staging slots.
+            diagnostic_log(
+                logger,
+                "hicache.prefetch.declined",
+                rid=req_id,
+                reason="already_in_progress",
+                aligned_prefetch_tokens=prefetch_length,
+            )
             return
 
         # Buffer mode holds no tree state during the fetch: buffers are
@@ -1774,6 +1806,14 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if anchor_lock_params is not None:
                 self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+            diagnostic_log(
+                logger,
+                "hicache.prefetch.declined",
+                rid=req_id,
+                reason="aux_host_allocation_failed",
+                aligned_prefetch_tokens=prefetch_length,
+                prepared_components=[str(ct) for ct in comp_xfers],
+            )
             return
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -1786,6 +1826,14 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=aux_xfers or None,
         )
         stats["issued"] += 1
+        diagnostic_log(
+            logger,
+            "hicache.prefetch.issued",
+            rid=req_id,
+            aligned_prefetch_tokens=prefetch_length,
+            pools=[str(transfer.name) for transfer in aux_xfers],
+            buffer_mode=buffer_mode,
+        )
         # Snapshots for the L3 miss accounting at the query outcome (the
         # hit/revoke drains): requested span and total prompt length.
         operation.stats_requested_tokens = prefetch_length

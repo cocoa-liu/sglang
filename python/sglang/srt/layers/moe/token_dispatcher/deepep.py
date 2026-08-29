@@ -7,6 +7,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.debug_utils.dsv4_l3_diagnostics import (
+    diagnostic_device_sync,
+    diagnostic_log_once,
+    diagnostic_operation,
+    diagnostic_runtime_snapshot,
+    diagnostics_enabled,
+    tensor_metadata,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -901,6 +909,20 @@ class DeepEPDispatcher(BaseDispatcher):
         super().__init__()
 
         self.deepep_mode = deepep_mode
+        diagnostic_log_once(
+            logger,
+            "deepep_dispatcher_config",
+            "deepep.dispatcher.config",
+            deepep_mode=str(deepep_mode),
+            async_finish=async_finish,
+            return_recv_hook=return_recv_hook,
+            router_topk=router_topk,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            params_dtype=str(params_dtype),
+        )
+        diagnostic_runtime_snapshot(logger, "deepep_dispatcher")
 
         common_kwargs = dict(
             group=group,
@@ -956,18 +978,48 @@ class DeepEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl().dispatch_a(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
-        self._dispatch_intermediate_state = inner_state
+        if not diagnostics_enabled():
+            self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+            self._dispatch_intermediate_state = self._get_impl().dispatch_a(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
+            return
+        impl = self._get_impl()
+        with diagnostic_operation(
+            logger,
+            "deepep.dispatch_a",
+            mode=str(impl.dispatch_mode),
+            dispatcher_id=id(self),
+            hidden_states=tensor_metadata(hidden_states),
+            topk_ids=tensor_metadata(topk_output.topk_ids),
+        ):
+            self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+            self._dispatch_intermediate_state = impl.dispatch_a(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
     def dispatch_b(self):
-        self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
-        inner_state = self._dispatch_intermediate_state
-        del self._dispatch_intermediate_state
-        return self._get_impl().dispatch_b(*inner_state)
+        if not diagnostics_enabled():
+            self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
+            inner_state = self._dispatch_intermediate_state
+            del self._dispatch_intermediate_state
+            return self._get_impl().dispatch_b(*inner_state)
+        impl = self._get_impl()
+        with diagnostic_operation(
+            logger,
+            "deepep.dispatch_b",
+            mode=str(impl.dispatch_mode),
+            dispatcher_id=id(self),
+        ):
+            self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
+            inner_state = self._dispatch_intermediate_state
+            del self._dispatch_intermediate_state
+            diagnostic_device_sync(logger, "deepep.dispatch_b.before")
+            result = impl.dispatch_b(*inner_state)
+            diagnostic_device_sync(logger, "deepep.dispatch_b.after")
+            return result
 
     def combine(
         self,
@@ -982,19 +1034,49 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ):
         hidden_states, topk_ids, topk_weights = combine_input
-        self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl().combine_a(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-        )
-        self._combine_intermediate_state = inner_state
+        if not diagnostics_enabled():
+            self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
+            self._combine_intermediate_state = self._get_impl().combine_a(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
+            return
+        impl = self._get_impl()
+        with diagnostic_operation(
+            logger,
+            "deepep.combine_a",
+            mode=str(impl.dispatch_mode),
+            dispatcher_id=id(self),
+            hidden_states=tensor_metadata(hidden_states),
+        ):
+            self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
+            diagnostic_device_sync(logger, "deepep.combine_a.before")
+            self._combine_intermediate_state = impl.combine_a(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
 
     def combine_b(self):
-        self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
-        inner_state = self._combine_intermediate_state
-        del self._combine_intermediate_state
-        return self._get_impl().combine_b(*inner_state)
+        if not diagnostics_enabled():
+            self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
+            inner_state = self._combine_intermediate_state
+            del self._combine_intermediate_state
+            return self._get_impl().combine_b(*inner_state)
+        impl = self._get_impl()
+        with diagnostic_operation(
+            logger,
+            "deepep.combine_b",
+            mode=str(impl.dispatch_mode),
+            dispatcher_id=id(self),
+        ):
+            self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
+            inner_state = self._combine_intermediate_state
+            del self._combine_intermediate_state
+            result = impl.combine_b(*inner_state)
+            diagnostic_device_sync(logger, "deepep.combine_b.after")
+            return result
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()

@@ -70,6 +70,12 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.debug_utils.dsv4_l3_diagnostics import (
+    batch_metadata,
+    diagnostic_log,
+    diagnostic_method,
+    request_metadata,
+)
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -1922,6 +1928,13 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
+        if recv_reqs:
+            diagnostic_log(
+                logger,
+                "scheduler.requests.received",
+                received_count=len(recv_reqs),
+                requests=[request_metadata(req) for req in recv_reqs],
+            )
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         if get_mm().mm_feature_transport == "cuda_vmm":
@@ -3773,6 +3786,13 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    @diagnostic_method(
+        "scheduler.run_batch",
+        argument_index=1,
+        argument_name="batch",
+        metadata_fn=batch_metadata,
+        watchdog=True,
+    )
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,

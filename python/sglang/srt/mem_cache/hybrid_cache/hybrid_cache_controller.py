@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.debug_utils.dsv4_l3_diagnostics import diagnostic_log
 from sglang.srt.managers.cache_controller import (
     CacheOperation,
 )
@@ -138,6 +139,19 @@ class HybridCacheController(BaseHiCacheController):
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
+        diagnostic_log(
+            logger,
+            "hicache.storage_backend.attach",
+            storage_backend=startup_storage_backend,
+            host_pool_group_type=type(mem_pool_host).__name__,
+            storage_host_pool_type=type(self.storage_host_pool).__name__,
+            storage_host_pool_has_entries=hasattr(self.storage_host_pool, "entries"),
+            storage_host_pool_kv_buffer_is_none=(
+                getattr(self.storage_host_pool, "kv_buffer", "missing") is None
+            ),
+            pool_names=[str(entry.name) for entry in mem_pool_host.entries],
+            prefetch_threshold=prefetch_threshold,
+        )
         if startup_storage_backend is not None:
             self.attach_storage_backend(
                 storage_backend=startup_storage_backend,
@@ -583,6 +597,14 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        diagnostic_log(
+            logger,
+            "hicache.storage_hit_query.begin",
+            operation_id=getattr(operation, "id", None),
+            rid=getattr(operation, "request_id", None),
+            token_count=len(operation.token_ids),
+            pools=[str(t.name) for t in (operation.pool_transfers or [])],
+        )
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -619,6 +641,15 @@ class HybridCacheController(BaseHiCacheController):
                 operation.pool_transfers, hash_value, kv_hit_pages
             )
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        diagnostic_log(
+            logger,
+            "hicache.storage_hit_query.end",
+            operation_id=getattr(operation, "id", None),
+            rid=getattr(operation, "request_id", None),
+            requested_pages=len(hash_value),
+            hit_pages=kv_hit_pages,
+            pool_hits=hit_result.extra_pool_hit_pages,
+        )
 
         return (
             hash_value[:kv_hit_pages],
@@ -655,6 +686,14 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
+        diagnostic_log(
+            logger,
+            "hicache.page_transfer.begin",
+            operation_id=getattr(operation, "id", None),
+            rid=operation.request_id,
+            hash_pages=len(operation.hash_value),
+            pools=[str(t.name) for t in (operation.pool_transfers or [])],
+        )
         # A logical DSV4 FULL pool has no payload. Preserve the base controller's
         # per-batch ACK contract while letting the physical sidecar pools decide
         # whether the prefix is usable.
@@ -678,6 +717,15 @@ class HybridCacheController(BaseHiCacheController):
 
         # Read non-KV derived sidecar pool, e.g. SWA, Mamba.
         self._page_transfer_sidecar(operation, kv_completed_pages)
+        diagnostic_log(
+            logger,
+            "hicache.page_transfer.end",
+            operation_id=getattr(operation, "id", None),
+            rid=operation.request_id,
+            kv_completed_pages=kv_completed_pages,
+            pool_hits=operation.pool_storage_result.extra_pool_hit_pages,
+            terminated=operation.is_terminated(),
+        )
 
     def _page_transfer_sidecar(
         self, operation: PrefetchOperation, kv_completed_pages: int
@@ -723,6 +771,13 @@ class HybridCacheController(BaseHiCacheController):
         return
 
     def _page_backup(self, operation):
+        diagnostic_log(
+            logger,
+            "hicache.page_backup.begin",
+            operation_id=getattr(operation, "id", None),
+            token_count=len(operation.token_ids),
+            pools=[str(t.name) for t in (operation.pool_transfers or [])],
+        )
         # This point is reached after the request has produced cache data. It lets
         # backends defer runtime-sensitive setup without moving model-specific
         # lifecycle handling into the controller.
@@ -757,6 +812,13 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+        diagnostic_log(
+            logger,
+            "hicache.page_backup.end",
+            operation_id=getattr(operation, "id", None),
+            completed_tokens=operation.completed_tokens,
+            pool_hits=operation.pool_storage_result.extra_pool_hit_pages,
+        )
 
     @staticmethod
     def _pool_results_complete(transfers: list[PoolTransfer], results: dict) -> bool:
