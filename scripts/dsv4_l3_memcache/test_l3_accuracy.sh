@@ -7,14 +7,14 @@ usage() {
 Usage: test_l3_accuracy.sh REQUEST_LENGTH REQUEST_COUNT [100|50]
 
 Required environment:
-  SGLANG_DIR   SGLang runtime checkout used by the running server
   SERVER_LOG   Log file of the running SGLang server
 
 Optional environment:
+  SGLANG_DIR   Default: /home/l00951280/code/sglang
   MODEL_PATH   Default: /home/weights/DeepSeek-V4-Flash-w8a8-mtp
   BASE_URL     Default: http://127.0.0.1:30000
   DP_RANKS     Auto-detected from the running server when unset
-  RESULT_ROOT  Default: /home/cx/log/dsv4_memcache_l3_accuracy
+  RESULT_ROOT  Default: /home/l00951280/dsv4-l3-results/l3-accuracy
   OUTPUT_LEN   Default: 32
   SEED_BASE    Default: 60000
 
@@ -33,10 +33,10 @@ REQUEST_COUNT=$2
 HIT=${3:-100}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-SGLANG_DIR=${SGLANG_DIR:-/home/cx/sglang}
+SGLANG_DIR=${SGLANG_DIR:-/home/l00951280/code/sglang}
 MODEL_PATH=${MODEL_PATH:-/home/weights/DeepSeek-V4-Flash-w8a8-mtp}
 BASE_URL=${BASE_URL:-http://127.0.0.1:30000}
-RESULT_ROOT=${RESULT_ROOT:-/home/cx/log/dsv4_memcache_l3_accuracy}
+RESULT_ROOT=${RESULT_ROOT:-/home/l00951280/dsv4-l3-results/l3-accuracy}
 OUTPUT_LEN=${OUTPUT_LEN:-32}
 SEED_BASE=${SEED_BASE:-60000}
 SERVER_LOG=${SERVER_LOG:-}

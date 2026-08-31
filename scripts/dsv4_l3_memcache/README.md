@@ -214,13 +214,13 @@ write-through to finish, flushes L1/L2 while retaining MemCache L3, replays the
 same inputs, and compares every generated token. Unlike a performance run,
 `--skip-measure` is intentional: only populate and correctness replay are run.
 
-The current `/home/cx` layout can be prepared as follows:
+Use the established test-machine layout:
 
 ```bash
-export TOOLS_DIR=/home/cx/sglang-tools/scripts/dsv4_l3_memcache
-export SGLANG_DIR=/home/cx/sglang
+export TOOLS_DIR=/home/l00951280/code/sglang-tools/scripts/dsv4_l3_memcache
+export SGLANG_DIR=/home/l00951280/code/sglang
 export MODEL_PATH=/home/weights/DeepSeek-V4-Flash-w8a8-mtp
-export SERVER_LOG=$(ls -dt /home/cx/log/dsv4_npu_hicache_l3_*/server.log | head -1)
+export SERVER_LOG=/home/l00951280/dsv4-l3-results/<server-run>/server/server.log
 ```
 
 Confirm that the tools checkout contains the accuracy driver:
@@ -229,31 +229,31 @@ Confirm that the tools checkout contains the accuracy driver:
 test -f "$TOOLS_DIR/bench_ids_dsv4.py"
 ```
 
-Run a small case before longer inputs. `DP_RANKS` is normally detected from
-the running server's `--dp-size`; export it explicitly if process inspection is
-not available inside the container.
+The established server topology is DP=16. Run the 128K accuracy case with 32
+total requests, 16 concurrent requests per wave, and 32 generated tokens per
+request:
 
 ```bash
-bash "$TOOLS_DIR/test_l3_accuracy.sh" 8192 8 100
-bash "$TOOLS_DIR/test_l3_accuracy.sh" 32768 8 100
-bash "$TOOLS_DIR/test_l3_accuracy.sh" 65536 8 100
-bash "$TOOLS_DIR/test_l3_accuracy.sh" 131072 8 100
+DP_RANKS=16 bash "$TOOLS_DIR/test_l3_accuracy.sh" 131072 32 100
 ```
 
-For a 16-DP server, use a multiple of 16 requests, for example:
+For staged troubleshooting, keep the same 32 requests and DP=16 while reducing
+only the input length:
 
 ```bash
-DP_RANKS=16 bash "$TOOLS_DIR/test_l3_accuracy.sh" 131072 16 100
+DP_RANKS=16 bash "$TOOLS_DIR/test_l3_accuracy.sh" 8192 32 100
+DP_RANKS=16 bash "$TOOLS_DIR/test_l3_accuracy.sh" 32768 32 100
+DP_RANKS=16 bash "$TOOLS_DIR/test_l3_accuracy.sh" 65536 32 100
 ```
 
 The test passes only when all replay outputs are token-for-token identical and
 the server records a positive cache hit after L1/L2 were flushed. Artifacts are
-stored under `/home/cx/log/dsv4_memcache_l3_accuracy` by default. A passing
-summary resembles:
+stored under `/home/l00951280/dsv4-l3-results/l3-accuracy` by default. A
+passing summary resembles:
 
 ```text
 PASS
-identical_outputs=8/8
+identical_outputs=32/32
 post_flush_cached_token_sum=...
 ```
 
