@@ -15,6 +15,10 @@ runtime code in a separate `lc-dsv4-l3` checkout.
 - `local_128k_capacity_smoke.py`: performs a small cold-write and L3-hit probe.
 - `bench_l3_matrix.py`: runs the two-cohort 128K validation workload.
 - `verify_128k_result.py`: checks the expected hit coverage in the result JSON.
+- `bench_ids_dsv4.py`: deterministic token-ID populate/replay driver copied
+  from `cx22757/sglang` `main-L3` commit `36eeed06a72a`.
+- `test_l3_accuracy.sh`: validates deterministic output-token accuracy after
+  flushing L1/L2 and replaying the saved prefix from MemCache L3.
 
 ## Validated topology
 
@@ -201,6 +205,61 @@ An empty `grep` result is expected. If DeepEP fails, preserve the exact DeepEP
 commit, complete server log, request phase, and device health output. Do not
 classify the error as an L3 failure until the same request sequence is compared
 with L3 disabled on the same software stack.
+
+## Run the L3 output accuracy test
+
+This test uses the included `bench_ids_dsv4.py`. It generates
+deterministic token-id inputs, saves the populate output IDs, waits for
+write-through to finish, flushes L1/L2 while retaining MemCache L3, replays the
+same inputs, and compares every generated token. Unlike a performance run,
+`--skip-measure` is intentional: only populate and correctness replay are run.
+
+The current `/home/cx` layout can be prepared as follows:
+
+```bash
+export TOOLS_DIR=/home/cx/sglang-tools/scripts/dsv4_l3_memcache
+export SGLANG_DIR=/home/cx/sglang
+export MODEL_PATH=/home/weights/DeepSeek-V4-Flash-w8a8-mtp
+export SERVER_LOG=$(ls -dt /home/cx/log/dsv4_npu_hicache_l3_*/server.log | head -1)
+```
+
+Confirm that the tools checkout contains the accuracy driver:
+
+```bash
+test -f "$TOOLS_DIR/bench_ids_dsv4.py"
+```
+
+Run a small case before longer inputs. `DP_RANKS` is normally detected from
+the running server's `--dp-size`; export it explicitly if process inspection is
+not available inside the container.
+
+```bash
+bash "$TOOLS_DIR/test_l3_accuracy.sh" 8192 8 100
+bash "$TOOLS_DIR/test_l3_accuracy.sh" 32768 8 100
+bash "$TOOLS_DIR/test_l3_accuracy.sh" 65536 8 100
+bash "$TOOLS_DIR/test_l3_accuracy.sh" 131072 8 100
+```
+
+For a 16-DP server, use a multiple of 16 requests, for example:
+
+```bash
+DP_RANKS=16 bash "$TOOLS_DIR/test_l3_accuracy.sh" 131072 16 100
+```
+
+The test passes only when all replay outputs are token-for-token identical and
+the server records a positive cache hit after L1/L2 were flushed. Artifacts are
+stored under `/home/cx/log/dsv4_memcache_l3_accuracy` by default. A passing
+summary resembles:
+
+```text
+PASS
+identical_outputs=8/8
+post_flush_cached_token_sum=...
+```
+
+The upstream driver's `50` mode stores and replays the first half of each
+prefix. It validates the accuracy of that half-length L3 object; it does not
+compare the final output of a full-length request whose first half is cached.
 
 ## Stop the processes
 
