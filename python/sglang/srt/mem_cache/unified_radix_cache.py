@@ -2310,27 +2310,10 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         operation.pool_transfers_done = True
                 if ack.completed_req:
-                    # Temporary diagnostic for the 128K L3 completion hang.
-                    logger.info(
-                        "[DSV4_L3_PREFETCH_DEBUG] terminal_ack_received "
-                        "rid=%s operation_id=%s completed_tokens=%d "
-                        "pool_transfers_done=%s ongoing=%s",
-                        operation.request_id,
-                        operation.id,
-                        operation.completed_tokens,
-                        operation.pool_transfers_done,
-                        operation.request_id in self.ongoing_prefetch,
-                    )
                     if operation.request_id in self.ongoing_prefetch:
                         # check_prefetch_progress() is not called for this rid yet.
                         # Let us insert the prefetch result into the radix tree.
                         self._handle_prefetch_result(operation)
-                        logger.info(
-                            "[DSV4_L3_PREFETCH_DEBUG] terminal_ack_committed "
-                            "rid=%s operation_id=%s",
-                            operation.request_id,
-                            operation.id,
-                        )
                     cc.append_host_mem_release(
                         operation.host_indices[operation.completed_tokens :],
                         (

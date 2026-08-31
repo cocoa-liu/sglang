@@ -847,17 +847,6 @@ class HybridCacheController(BaseHiCacheController):
                             operation=operation,
                         )
                     )
-                    # Temporary diagnostic for the 128K L3 completion hang.
-                    logger.info(
-                        "[DSV4_L3_PREFETCH_DEBUG] terminal_ack_enqueued "
-                        "rid=%s operation_id=%s completed_tokens=%d "
-                        "pool_transfers_done=%s terminated=%s",
-                        operation.request_id,
-                        operation.id,
-                        operation.completed_tokens,
-                        operation.pool_transfers_done,
-                        operation.is_terminated(),
-                    )
             except Empty:
                 continue
 
