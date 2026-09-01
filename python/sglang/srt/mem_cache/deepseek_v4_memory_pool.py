@@ -1017,7 +1017,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 row[:head_dim].fill_(float("-inf"))
                 row[head_dim:].zero_()
             else:
-                start = req_pool_idx * pool.ring_size
+                # Some backends reserve physical state pages before the
+                # request banks (Ascend cache_mode=1 reserves block 0). Keep
+                # request teardown on the same address mapping used by the
+                # compressor and HiCache host view.
+                page_offset = int(getattr(pool, "state_page_offset", 0))
+                start = (page_offset + req_pool_idx) * pool.ring_size
                 rows = state[start : start + pool.ring_size]
                 half = rows.shape[-1] // 2
                 rows[:, :half].zero_()
