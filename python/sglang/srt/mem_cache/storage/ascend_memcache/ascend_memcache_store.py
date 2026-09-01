@@ -1096,9 +1096,44 @@ class AscendMemcacheStore(HiCacheStorage):
         return len(query_keys) // key_multiplier
 
     def clear(self) -> None:
-        if not self._is_store_initialized():
-            return
-        self.store.remove_all()
+        """Remove all MemCache objects without breaking deferred NPU init.
+
+        DSV4 deliberately delays BM/HYBM initialization until the first backup.
+        A clear request commonly arrives before that first backup (for example at
+        the beginning of an accuracy test).  Treating the uninitialized state as
+        an already-empty backend is incorrect because the external Holder can
+        still contain objects written by an earlier SGLang process.
+
+        Use a short-lived metadata-only client in that case.  ``init_bm=False``
+        connects to the metadata service but does not create the NPU-side BM/HYBM
+        resources whose early initialization the lazy lifecycle is designed to
+        avoid.
+        """
+        if self._is_store_initialized():
+            result = self.store.remove_all()
+        else:
+            clear_client = self._store_factory()
+            try:
+                if clear_client.setup(self._local_cfg) != 0:
+                    raise RuntimeError(
+                        "Memcache metadata-only clear client setup failed"
+                    )
+                if clear_client.init(self._device_id, False) != 0:
+                    raise RuntimeError(
+                        "Memcache metadata-only clear client init failed"
+                    )
+                result = clear_client.remove_all()
+            finally:
+                try:
+                    clear_client.close()
+                except Exception:
+                    logger.warning(
+                        "Failed to close Memcache metadata-only clear client",
+                        exc_info=True,
+                    )
+
+        if int(result) != 0:
+            raise RuntimeError(f"Memcache remove_all failed with code {result}")
 
     def close(self) -> None:
         if self.store is None:

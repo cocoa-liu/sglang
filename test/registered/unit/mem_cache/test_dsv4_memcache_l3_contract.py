@@ -42,6 +42,7 @@ class _FakeObjectStore:
 
 class _LifecycleObjectStore:
     instances = []
+    remove_all_result = 0
 
     def __init__(self):
         self.setup_calls = 0
@@ -49,6 +50,8 @@ class _LifecycleObjectStore:
         self.registered_buffers = []
         self.put_calls = []
         self.objects = {}
+        self.remove_all_calls = 0
+        self.closed = False
         self.__class__.instances.append(self)
 
     def setup(self, _config):
@@ -81,7 +84,12 @@ class _LifecycleObjectStore:
             results.append(0)
         return results
 
+    def remove_all(self):
+        self.remove_all_calls += 1
+        return self.remove_all_result
+
     def close(self):
+        self.closed = True
         return None
 
 
@@ -100,6 +108,7 @@ def _make_memcache(existing=()):
 
 def _make_lazy_memcache(protocol="device_sdma"):
     _LifecycleObjectStore.instances.clear()
+    _LifecycleObjectStore.remove_all_result = 0
     backend = AscendMemcacheStore.__new__(AscendMemcacheStore)
     backend.store = None
     backend.storage_config = SimpleNamespace(tp_rank=3)
@@ -114,6 +123,33 @@ def _make_lazy_memcache(protocol="device_sdma"):
     backend._defer_runtime_init = True
     backend._use_dram_staging = protocol == "device_sdma"
     return backend
+
+
+def test_lazy_clear_uses_metadata_only_client_without_initializing_runtime_store():
+    backend = _make_lazy_memcache()
+
+    backend.clear()
+
+    assert not backend._store_initialized
+    assert backend.store is None
+    assert len(_LifecycleObjectStore.instances) == 1
+    clear_client = _LifecycleObjectStore.instances[0]
+    assert clear_client.setup_calls == 1
+    assert clear_client.init_calls == [(3, False)]
+    assert clear_client.remove_all_calls == 1
+    assert clear_client.closed
+
+
+def test_lazy_clear_propagates_memcache_remove_all_failure():
+    backend = _make_lazy_memcache()
+    _LifecycleObjectStore.remove_all_result = -7
+
+    try:
+        backend.clear()
+    except RuntimeError as exc:
+        assert "remove_all failed with code -7" in str(exc)
+    else:
+        raise AssertionError("Memcache clear failure must not be reported as success")
 
 
 def test_device_transports_lazy_init_is_limited_to_dsv4_pool_groups():
