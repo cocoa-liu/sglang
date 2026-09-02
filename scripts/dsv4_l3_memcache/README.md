@@ -248,11 +248,16 @@ with L3 disabled on the same software stack.
 ## Run the L3 output accuracy test
 
 This test uses the included `bench_ids_dsv4.py`. It first warms deterministic
-token-ID inputs, then saves output IDs from a resident-cache execution. After
-write-through finishes, it flushes L1/L2 while retaining MemCache L3 and
-replays the same inputs. Both compared executions use the same C128 cache
-boundary; the only intended difference is whether the cached pages are
-resident or restored from L3.
+token-ID inputs, then saves output IDs from a resident-cache execution. Before
+testing L3, it immediately repeats the same resident-cache execution. This
+control must be token-for-token identical; otherwise the runtime is not
+deterministic enough for exact generated tokens to be used as an L3 oracle and
+the script exits with `INCONCLUSIVE` without replaying L3.
+
+After that control passes, the script waits for write-through, flushes L1/L2
+while retaining MemCache L3, and replays the same inputs. Both compared
+executions use the same C128 cache boundary; the only intended difference is
+whether the cached pages are resident or restored from L3.
 
 Do not use a cold-prefill output as the reference for this check. A cold prefill
 and a partial-cache prefill use different numerical execution paths and may
@@ -301,6 +306,7 @@ resembles:
 PASS
 identical_outputs=32/32
 l1_cached_token_sum=4128768
+l1_control_cached_token_sum=4128768
 l3_cached_token_sum=4128768
 ```
 

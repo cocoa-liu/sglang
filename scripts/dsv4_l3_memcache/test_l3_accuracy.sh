@@ -111,6 +111,7 @@ RESULT_DIR="${RESULT_ROOT}/${TAG}"
 FIRST_OUT="${RESULT_DIR}/first_out.json"
 WARM_LOG="${RESULT_DIR}/warm.log"
 BASELINE_LOG="${RESULT_DIR}/l1-baseline.log"
+L1_CONTROL_LOG="${RESULT_DIR}/l1-control.log"
 REPLAY_LOG="${RESULT_DIR}/replay.log"
 SUMMARY_FILE="${RESULT_DIR}/summary.txt"
 mkdir -p "$RESULT_DIR"
@@ -251,6 +252,58 @@ if (( L1_CACHED_TOKEN_SUM != EXPECTED_CACHED_TOKEN_SUM )); then
 fi
 echo "[OK] resident-cache baseline cached-token sum: $L1_CACHED_TOKEN_SUM"
 
+# Exact generated-token equality is useful only if the runtime can reproduce
+# it without changing cache tiers. Gate the L3 comparison with an immediate
+# resident-cache repeat so DeepEP/MoE numerical nondeterminism cannot be
+# misclassified as an L3 data-integrity failure.
+L1_CONTROL_LOG_START_LINE=$(wc -l <"$SERVER_LOG")
+
+echo "=== Repeat from resident cache to validate the accuracy oracle ==="
+python3 -u "$BENCH_SCRIPT" \
+  --model-path "$MODEL_PATH" \
+  --input-len "$REQ_LEN" \
+  --num-prompts "$REQUEST_COUNT" \
+  --output-len "$OUTPUT_LEN" \
+  --route roundrobin \
+  --dp-ranks "$DP_RANKS" \
+  --concurrency "$DP_RANKS" \
+  --pop-conc "$DP_RANKS" \
+  --hit 100 \
+  --skip-populate \
+  --skip-measure \
+  --tag "${TAG}_l1_control" \
+  --load-first-out "$FIRST_OUT" \
+  --server-log "$SERVER_LOG" \
+  --seed-base "$SEED_BASE" \
+  2>&1 | tee "$L1_CONTROL_LOG"
+
+L1_CONTROL_WINDOW="${RESULT_DIR}/server-l1-control-window.log"
+L1_CONTROL_CACHED_TOKEN_SUM=$(collect_cached_token_sum \
+  "$L1_CONTROL_LOG_START_LINE" "$L1_CONTROL_WINDOW" \
+  "$EXPECTED_CACHED_TOKEN_SUM")
+if (( L1_CONTROL_CACHED_TOKEN_SUM != EXPECTED_CACHED_TOKEN_SUM )); then
+  echo "[FAIL] resident-cache control did not use the expected cache boundary" >&2
+  echo "expected_cached_token_sum=$EXPECTED_CACHED_TOKEN_SUM" >&2
+  echo "actual_cached_token_sum=$L1_CONTROL_CACHED_TOKEN_SUM" >&2
+  echo "Inspect $L1_CONTROL_WINDOW" >&2
+  exit 1
+fi
+echo "[OK] resident-cache control cached-token sum: $L1_CONTROL_CACHED_TOKEN_SUM"
+
+if grep -qE 'DIVERGED|FAILED|\[replay\] NOTE:' "$L1_CONTROL_LOG"; then
+  echo "[INCONCLUSIVE] resident-cache repeat differs from its resident-cache baseline" >&2
+  echo "Exact generated-token equality is not a valid L3 oracle on this runtime." >&2
+  echo "L3 replay was not started; inspect $L1_CONTROL_LOG" >&2
+  exit 3
+fi
+
+EXPECTED_L1_CONTROL="[replay] ${REQUEST_COUNT}/${REQUEST_COUNT} identical"
+if ! grep -Fq "$EXPECTED_L1_CONTROL" "$L1_CONTROL_LOG"; then
+  echo "[FAIL] expected resident-cache control result not found: $EXPECTED_L1_CONTROL" >&2
+  exit 1
+fi
+echo "[OK] accuracy oracle is stable: resident cache ${REQUEST_COUNT}/${REQUEST_COUNT} identical"
+
 echo "=== Wait for L2-to-L3 write-through, then drop L1/L2 only ==="
 flush_l1_l2_when_idle
 
@@ -311,6 +364,7 @@ fi
   echo "identical_outputs=${REQUEST_COUNT}/${REQUEST_COUNT}"
   echo "expected_cached_per_request=$EXPECTED_CACHED_PER_REQUEST"
   echo "l1_cached_token_sum=$L1_CACHED_TOKEN_SUM"
+  echo "l1_control_cached_token_sum=$L1_CONTROL_CACHED_TOKEN_SUM"
   echo "l3_cached_token_sum=$L3_CACHED_TOKEN_SUM"
   echo "result_dir=$RESULT_DIR"
 } | tee "$SUMMARY_FILE"
