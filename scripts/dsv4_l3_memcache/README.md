@@ -19,8 +19,8 @@ runtime code in a separate `lc-dsv4-l3` checkout.
 - `verify_128k_result.py`: checks the expected hit coverage in the result JSON.
 - `bench_ids_dsv4.py`: deterministic token-ID populate/replay driver copied
   from `cx22757/sglang` `main-L3` commit `36eeed06a72a`.
-- `test_l3_accuracy.sh`: validates deterministic output-token accuracy after
-  flushing L1/L2 and replaying the saved prefix from MemCache L3.
+- `test_l3_accuracy.sh`: compares deterministic output tokens from the same
+  partial-cache boundary before and after restoring it from MemCache L3.
 
 ## Validated topology
 
@@ -247,11 +247,16 @@ with L3 disabled on the same software stack.
 
 ## Run the L3 output accuracy test
 
-This test uses the included `bench_ids_dsv4.py`. It generates
-deterministic token-id inputs, saves the populate output IDs, waits for
-write-through to finish, flushes L1/L2 while retaining MemCache L3, replays the
-same inputs, and compares every generated token. Unlike a performance run,
-`--skip-measure` is intentional: only populate and correctness replay are run.
+This test uses the included `bench_ids_dsv4.py`. It first warms deterministic
+token-ID inputs, then saves output IDs from a resident-cache execution. After
+write-through finishes, it flushes L1/L2 while retaining MemCache L3 and
+replays the same inputs. Both compared executions use the same C128 cache
+boundary; the only intended difference is whether the cached pages are
+resident or restored from L3.
+
+Do not use a cold-prefill output as the reference for this check. A cold prefill
+and a partial-cache prefill use different numerical execution paths and may
+generate different tokens even when the cache contents are correct.
 
 Use the established test-machine layout:
 
@@ -285,20 +290,22 @@ DP_RANKS=16 bash "$TOOLS_DIR/test_l3_accuracy.sh" 32768 32 100
 DP_RANKS=16 bash "$TOOLS_DIR/test_l3_accuracy.sh" 65536 32 100
 ```
 
-The test passes only when all replay outputs are token-for-token identical and
-the server records a positive cache hit after L1/L2 were flushed. Artifacts are
-stored under `/home/l00951280/dsv4-l3-results/l3-accuracy` by default. A
-passing summary resembles:
+For a 131072-token input, both sides must report 129024 cached tokens per
+request and recompute the remaining 2048-token C128 group. The test passes only
+when those cache boundaries match and all replay outputs are token-for-token
+identical. Artifacts are stored under
+`/home/l00951280/dsv4-l3-results/l3-accuracy` by default. A passing summary
+resembles:
 
 ```text
 PASS
 identical_outputs=32/32
-post_flush_cached_token_sum=...
+l1_cached_token_sum=4128768
+l3_cached_token_sum=4128768
 ```
 
-The upstream driver's `50` mode stores and replays the first half of each
-prefix. It validates the accuracy of that half-length L3 object; it does not
-compare the final output of a full-length request whose first half is cached.
+The same-boundary accuracy wrapper currently supports `100` mode only. Use the
+performance matrix scripts for 50% hit-rate measurements.
 
 ## Stop the processes
 

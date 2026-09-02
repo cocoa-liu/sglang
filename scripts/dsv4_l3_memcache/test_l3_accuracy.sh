@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: test_l3_accuracy.sh REQUEST_LENGTH REQUEST_COUNT [100|50]
+Usage: test_l3_accuracy.sh REQUEST_LENGTH REQUEST_COUNT [100]
 
 Required environment:
   SERVER_LOG   Log file of the running SGLang server
@@ -20,6 +20,14 @@ Optional environment:
 
 The server must already be running with the ascend_memcache storage backend.
 Run this test while no other client is sending requests to the server.
+
+The test compares two executions with the same C128 cache boundary:
+  1. resident L1 cache hit;
+  2. MemCache L3 restore after flushing L1/L2.
+
+Comparing a cold prefill with a partial-cache prefill is intentionally avoided,
+because their different numerical execution paths can produce different output
+tokens even when the restored cache data is correct.
 EOF
 }
 
@@ -50,8 +58,8 @@ if ! [[ "$REQUEST_COUNT" =~ ^[1-9][0-9]*$ ]]; then
   echo "REQUEST_COUNT must be a positive integer: $REQUEST_COUNT" >&2
   exit 2
 fi
-if [[ "$HIT" != "100" && "$HIT" != "50" ]]; then
-  echo "HIT must be 100 or 50: $HIT" >&2
+if [[ "$HIT" != "100" ]]; then
+  echo "This same-boundary accuracy test currently supports HIT=100 only: $HIT" >&2
   exit 2
 fi
 
@@ -60,8 +68,8 @@ if (( REQ_LEN % 2048 != 0 )); then
   echo "REQUEST_LENGTH must be a multiple of 2048: $REQ_LEN" >&2
   exit 2
 fi
-if [[ "$HIT" == "50" ]] && (( REQ_LEN % 4096 != 0 )); then
-  echo "50% mode requires REQUEST_LENGTH to be a multiple of 4096: $REQ_LEN" >&2
+if (( REQ_LEN < 4096 )); then
+  echo "REQUEST_LENGTH must be at least 4096: $REQ_LEN" >&2
   exit 2
 fi
 
@@ -101,10 +109,18 @@ RUN_ID=$(date +%Y%m%d_%H%M%S)
 TAG="memcache_l3_accuracy_${REQ_LEN}_${HIT}_${RUN_ID}"
 RESULT_DIR="${RESULT_ROOT}/${TAG}"
 FIRST_OUT="${RESULT_DIR}/first_out.json"
-POPULATE_LOG="${RESULT_DIR}/populate.log"
+WARM_LOG="${RESULT_DIR}/warm.log"
+BASELINE_LOG="${RESULT_DIR}/l1-baseline.log"
 REPLAY_LOG="${RESULT_DIR}/replay.log"
 SUMMARY_FILE="${RESULT_DIR}/summary.txt"
 mkdir -p "$RESULT_DIR"
+
+# A C128 group contains 128 pages x 16 tokens. SGLang keeps one token out of
+# the radix-cache hit and the DSV4 sidecars restore only complete C128 groups,
+# so an aligned request reuses one complete group less than its input length.
+C128_GROUP_TOKENS=2048
+EXPECTED_CACHED_PER_REQUEST=$((REQ_LEN - C128_GROUP_TOKENS))
+EXPECTED_CACHED_TOKEN_SUM=$((EXPECTED_CACHED_PER_REQUEST * REQUEST_COUNT))
 
 export PYTHONPATH="${SGLANG_DIR}/python:${PYTHONPATH:-}"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
@@ -137,10 +153,33 @@ clear_l3_storage() {
   echo "[OK] L3 cleared: $output"
 }
 
+collect_cached_token_sum() {
+  local start_line=$1
+  local output_file=$2
+  local expected_sum=$3
+  local cached_sum=0
+
+  for _ in $(seq 1 30); do
+    tail -n "+$((start_line + 1))" "$SERVER_LOG" >"$output_file"
+    cached_sum=$(
+      sed -nE 's/.*#cached-token: ([0-9]+).*/\1/p' "$output_file" \
+        | awk '{sum += $1} END {print sum + 0}'
+    )
+    if (( cached_sum >= expected_sum )); then
+      break
+    fi
+    sleep 1
+  done
+
+  printf '%s\n' "$cached_sum"
+}
+
 echo "=== DeepSeek V4 MemCache L3 accuracy test ==="
 echo "request_length=$REQ_LEN"
 echo "request_count=$REQUEST_COUNT"
 echo "stored_prefix_percent=$HIT"
+echo "comparison=l1_partial_hit_vs_l3_partial_hit"
+echo "expected_cached_per_request=$EXPECTED_CACHED_PER_REQUEST"
 echo "output_length=$OUTPUT_LEN"
 echo "dp_ranks=$DP_RANKS"
 echo "server_log=$SERVER_LOG"
@@ -155,7 +194,29 @@ flush_l1_l2_when_idle
 clear_l3_storage
 flush_l1_l2_when_idle
 
-echo "=== Populate deterministic prefixes and save reference output_ids ==="
+echo "=== Warm deterministic prefixes into the resident cache ==="
+python3 -u "$BENCH_SCRIPT" \
+  --model-path "$MODEL_PATH" \
+  --input-len "$REQ_LEN" \
+  --num-prompts "$REQUEST_COUNT" \
+  --output-len 1 \
+  --route roundrobin \
+  --dp-ranks "$DP_RANKS" \
+  --concurrency "$DP_RANKS" \
+  --pop-conc "$DP_RANKS" \
+  --hit 100 \
+  --populate-only \
+  --tag "${TAG}_warm" \
+  --server-log "$SERVER_LOG" \
+  --seed-base "$SEED_BASE" \
+  2>&1 | tee "$WARM_LOG"
+
+# Capture the reference through the same partial-cache execution path that the
+# L3 replay will use. The only intended difference is the source of the cached
+# pages: resident cache here, MemCache L3 after the flush below.
+BASELINE_LOG_START_LINE=$(wc -l <"$SERVER_LOG")
+
+echo "=== Generate resident-cache baseline and save reference output_ids ==="
 python3 -u "$BENCH_SCRIPT" \
   --model-path "$MODEL_PATH" \
   --input-len "$REQ_LEN" \
@@ -165,24 +226,36 @@ python3 -u "$BENCH_SCRIPT" \
   --dp-ranks "$DP_RANKS" \
   --concurrency "$DP_RANKS" \
   --pop-conc "$DP_RANKS" \
-  --hit "$HIT" \
+  --hit 100 \
   --populate-only \
-  --tag "${TAG}_populate" \
+  --tag "${TAG}_l1_baseline" \
   --save-first-out "$FIRST_OUT" \
   --server-log "$SERVER_LOG" \
   --seed-base "$SEED_BASE" \
-  2>&1 | tee "$POPULATE_LOG"
+  2>&1 | tee "$BASELINE_LOG"
 
 if [[ ! -s "$FIRST_OUT" ]]; then
-  echo "[FAIL] populate did not save reference output_ids: $FIRST_OUT" >&2
+  echo "[FAIL] resident-cache baseline did not save output_ids: $FIRST_OUT" >&2
   exit 1
 fi
+
+L1_WINDOW="${RESULT_DIR}/server-l1-baseline-window.log"
+L1_CACHED_TOKEN_SUM=$(collect_cached_token_sum \
+  "$BASELINE_LOG_START_LINE" "$L1_WINDOW" "$EXPECTED_CACHED_TOKEN_SUM")
+if (( L1_CACHED_TOKEN_SUM != EXPECTED_CACHED_TOKEN_SUM )); then
+  echo "[FAIL] resident-cache baseline did not use the expected cache boundary" >&2
+  echo "expected_cached_token_sum=$EXPECTED_CACHED_TOKEN_SUM" >&2
+  echo "actual_cached_token_sum=$L1_CACHED_TOKEN_SUM" >&2
+  echo "Inspect $L1_WINDOW" >&2
+  exit 1
+fi
+echo "[OK] resident-cache baseline cached-token sum: $L1_CACHED_TOKEN_SUM"
 
 echo "=== Wait for L2-to-L3 write-through, then drop L1/L2 only ==="
 flush_l1_l2_when_idle
 
-# Only replay traffic is allowed after this offset. A positive cached-token
-# count therefore proves that the compared output used data retained in L3.
+# Only replay traffic is allowed after this offset. An exact cached-token sum
+# proves that the compared output used the same boundary, now restored from L3.
 REPLAY_LOG_START_LINE=$(wc -l <"$SERVER_LOG")
 
 echo "=== Replay from L3 and compare output_ids token by token ==="
@@ -195,7 +268,7 @@ python3 -u "$BENCH_SCRIPT" \
   --dp-ranks "$DP_RANKS" \
   --concurrency "$DP_RANKS" \
   --pop-conc "$DP_RANKS" \
-  --hit "$HIT" \
+  --hit 100 \
   --skip-populate \
   --skip-measure \
   --tag "${TAG}_replay" \
@@ -204,8 +277,20 @@ python3 -u "$BENCH_SCRIPT" \
   --seed-base "$SEED_BASE" \
   2>&1 | tee "$REPLAY_LOG"
 
+L3_WINDOW="${RESULT_DIR}/server-replay-window.log"
+L3_CACHED_TOKEN_SUM=$(collect_cached_token_sum \
+  "$REPLAY_LOG_START_LINE" "$L3_WINDOW" "$EXPECTED_CACHED_TOKEN_SUM")
+if (( L3_CACHED_TOKEN_SUM != EXPECTED_CACHED_TOKEN_SUM )); then
+  echo "[FAIL] L3 replay did not use the expected cache boundary" >&2
+  echo "expected_cached_token_sum=$EXPECTED_CACHED_TOKEN_SUM" >&2
+  echo "actual_cached_token_sum=$L3_CACHED_TOKEN_SUM" >&2
+  echo "Inspect $L3_WINDOW" >&2
+  exit 1
+fi
+echo "[OK] L3 replay cached-token sum: $L3_CACHED_TOKEN_SUM"
+
 if grep -qE 'DIVERGED|FAILED|\[replay\] NOTE:' "$REPLAY_LOG"; then
-  echo "[FAIL] replay output_ids differ from populate output_ids" >&2
+  echo "[FAIL] L3 replay differs from the same-boundary resident-cache baseline" >&2
   exit 1
 fi
 
@@ -215,35 +300,19 @@ if ! grep -Fq "$EXPECTED_REPLAY" "$REPLAY_LOG"; then
   exit 1
 fi
 
-L3_WINDOW="${RESULT_DIR}/server-replay-window.log"
-CACHED_TOKEN_SUM=0
-for _ in $(seq 1 30); do
-  tail -n "+$((REPLAY_LOG_START_LINE + 1))" "$SERVER_LOG" >"$L3_WINDOW"
-  CACHED_TOKEN_SUM=$(
-    sed -nE 's/.*#cached-token: ([0-9]+).*/\1/p' "$L3_WINDOW" \
-      | awk '{sum += $1} END {print sum + 0}'
-  )
-  if (( CACHED_TOKEN_SUM > 0 )); then
-    break
-  fi
-  sleep 1
-done
-if (( CACHED_TOKEN_SUM <= 0 )); then
-  echo "[FAIL] replay was accurate but no post-flush cache hit was recorded" >&2
-  echo "Inspect $L3_WINDOW and confirm that this server build logs #cached-token." >&2
-  exit 1
-fi
-
 {
   echo "PASS"
   echo "request_length=$REQ_LEN"
   echo "request_count=$REQUEST_COUNT"
   echo "stored_prefix_percent=$HIT"
+  echo "comparison=l1_partial_hit_vs_l3_partial_hit"
   echo "output_length=$OUTPUT_LEN"
   echo "dp_ranks=$DP_RANKS"
   echo "identical_outputs=${REQUEST_COUNT}/${REQUEST_COUNT}"
-  echo "post_flush_cached_token_sum=$CACHED_TOKEN_SUM"
+  echo "expected_cached_per_request=$EXPECTED_CACHED_PER_REQUEST"
+  echo "l1_cached_token_sum=$L1_CACHED_TOKEN_SUM"
+  echo "l3_cached_token_sum=$L3_CACHED_TOKEN_SUM"
   echo "result_dir=$RESULT_DIR"
 } | tee "$SUMMARY_FILE"
 
-echo "[PASS] MemCache L3 replay output_ids are token-for-token identical"
+echo "[PASS] MemCache L3 matches the same-boundary resident-cache baseline"
