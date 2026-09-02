@@ -11,8 +11,10 @@ It follows the same HiCacheStorage contract and key layout strategy, while using
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -169,6 +171,15 @@ class AscendMemcacheStore(HiCacheStorage):
         self._store_initialized = False
         self._store_init_lock = threading.Lock()
         self._pending_buffers: List[Tuple[int, int]] = []
+        # Temporary, opt-in data-path diagnostic. It records the bytes actually
+        # presented to MemCache on put and compares them with the bytes returned
+        # into the host pool on get. This deliberately stops before H2D so one
+        # run can separate storage/SDMA corruption from device restore/binding.
+        self._verify_roundtrip_bytes = os.getenv(
+            "SGLANG_DSV4_L3_VERIFY_BYTES", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._roundtrip_digests: dict[str, tuple[int, str]] = {}
+        self._roundtrip_digest_lock = threading.Lock()
 
         try:
             from memcache_hybrid import DistributedObjectStore, LocalConfig
@@ -228,6 +239,12 @@ class AscendMemcacheStore(HiCacheStorage):
                 )
             else:
                 self._ensure_initialized()
+
+            if self._verify_roundtrip_bytes:
+                logger.warning(
+                    "[DSV4_L3_BYTES] enabled; host buffers will be hashed before "
+                    "MemCache put and after MemCache get"
+                )
 
             if not init_bm:
                 logger.info(
@@ -715,6 +732,10 @@ class AscendMemcacheStore(HiCacheStorage):
                     "page-first host layout."
                 )
 
+            pre_io_digests = None
+            if is_set and getattr(self, "_verify_roundtrip_bytes", False):
+                pre_io_digests = self._digest_buffers(ptr_list, element_size_list)
+
             if is_set:
                 exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
@@ -728,16 +749,131 @@ class AscendMemcacheStore(HiCacheStorage):
                     )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
+                if pre_io_digests is not None:
+                    self._record_put_digests(
+                        transfer.name,
+                        key_strs,
+                        element_size_list,
+                        pre_io_digests,
+                        exist_result,
+                        io_results,
+                    )
             else:
                 start_time = time.perf_counter()
                 io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
                 )
+                if getattr(self, "_verify_roundtrip_bytes", False):
+                    self._compare_get_digests(
+                        transfer.name,
+                        key_strs,
+                        ptr_list,
+                        element_size_list,
+                        io_results,
+                    )
             pool_results = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
             )
             results[transfer.name] = pool_results
         return results
+
+    @staticmethod
+    def _digest_buffers(ptrs: List[int], sizes: List[int]) -> List[str]:
+        return [
+            hashlib.blake2b(
+                ctypes.string_at(int(ptr), int(size)), digest_size=16
+            ).hexdigest()
+            for ptr, size in zip(ptrs, sizes)
+        ]
+
+    def _record_put_digests(
+        self,
+        pool_name: PoolName,
+        keys: List[str],
+        sizes: List[int],
+        digests: List[str],
+        exist_result: List[int],
+        io_results: List[int],
+    ) -> None:
+        new_count = reused_count = changed_count = 0
+        changed_keys: List[str] = []
+        with self._roundtrip_digest_lock:
+            for key, size, digest, existed, io_result in zip(
+                keys, sizes, digests, exist_result, io_results
+            ):
+                previous = self._roundtrip_digests.get(key)
+                if existed == 1:
+                    reused_count += 1
+                    if previous is not None and previous != (int(size), digest):
+                        changed_count += 1
+                        if len(changed_keys) < 3:
+                            changed_keys.append(key)
+                    continue
+                if int(io_result) == 0:
+                    self._roundtrip_digests[key] = (int(size), digest)
+                    new_count += 1
+        log_fn = logger.warning if changed_count else logger.info
+        log_fn(
+            "[DSV4_L3_BYTES] phase=put pool=%s objects=%d bytes=%d "
+            "new=%d reused=%d source_changed=%d changed_keys=%s",
+            pool_name,
+            len(keys),
+            sum(sizes),
+            new_count,
+            reused_count,
+            changed_count,
+            changed_keys,
+        )
+
+    def _compare_get_digests(
+        self,
+        pool_name: PoolName,
+        keys: List[str],
+        ptrs: List[int],
+        sizes: List[int],
+        io_results: List[int],
+    ) -> None:
+        digests = self._digest_buffers(ptrs, sizes)
+        known_count = mismatch_count = unknown_count = failed_count = 0
+        mismatches = []
+        with self._roundtrip_digest_lock:
+            for key, size, digest, io_result in zip(
+                keys, sizes, digests, io_results
+            ):
+                if int(io_result) <= 0:
+                    failed_count += 1
+                    continue
+                expected = self._roundtrip_digests.get(key)
+                if expected is None:
+                    unknown_count += 1
+                    continue
+                known_count += 1
+                actual = (int(size), digest)
+                if actual != expected:
+                    mismatch_count += 1
+                    if len(mismatches) < 3:
+                        mismatches.append(
+                            {
+                                "key": key,
+                                "expected_size": expected[0],
+                                "actual_size": actual[0],
+                                "expected_digest": expected[1],
+                                "actual_digest": actual[1],
+                            }
+                        )
+        log_fn = logger.error if mismatch_count else logger.info
+        log_fn(
+            "[DSV4_L3_BYTES] phase=get pool=%s objects=%d bytes=%d "
+            "known=%d unknown=%d failed=%d mismatched=%d mismatches=%s",
+            pool_name,
+            len(keys),
+            sum(sizes),
+            known_count,
+            unknown_count,
+            failed_count,
+            mismatch_count,
+            mismatches,
+        )
 
     def _get_transfer_buffer_meta(self, host_pool, transfer, host_indices):
         ptrs, sizes = host_pool.get_page_buffer_meta(host_indices)
@@ -1134,6 +1270,11 @@ class AscendMemcacheStore(HiCacheStorage):
 
         if int(result) != 0:
             raise RuntimeError(f"Memcache remove_all failed with code {result}")
+        digest_lock = getattr(self, "_roundtrip_digest_lock", None)
+        digest_map = getattr(self, "_roundtrip_digests", None)
+        if digest_lock is not None and digest_map is not None:
+            with digest_lock:
+                digest_map.clear()
 
     def close(self) -> None:
         if self.store is None:
