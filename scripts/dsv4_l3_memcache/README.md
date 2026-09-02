@@ -11,6 +11,8 @@ runtime code in a separate `lc-dsv4-l3` checkout.
 - `start_local_holder.py`: allocates the local MemCache holder.
 - `local_meta.example.json`: metadata service configuration.
 - `local_memcache.example.json`: SGLang MemCache client configuration.
+- `restart_local_stack_128k.sh`: cleanly recreates and validates Meta, Holder,
+  and the 16-NPU SGLang service in one command.
 - `run_server_128k.sh`: starts the 16-NPU DeepSeek V4 Flash server.
 - `local_128k_capacity_smoke.py`: performs a small cold-write and L3-hit probe.
 - `bench_l3_matrix.py`: runs the two-cohort 128K validation workload.
@@ -70,6 +72,43 @@ physical pages. The `max_dram_size=600GB` client setting is an upper bound; it
 does not allocate 600 GB for each rank.
 
 ## Start MemCache
+
+### One-command clean restart (recommended)
+
+The following script stops the existing local SGLang, Holder, and Meta
+processes, then starts and validates the complete stack in dependency order. It
+does not reset the NPU. Defaults match the established test-machine layout:
+
+```bash
+export TOOLS_DIR=/home/l00951280/code/sglang-tools/scripts/dsv4_l3_memcache
+bash "$TOOLS_DIR/restart_local_stack_128k.sh"
+```
+
+It verifies all of the following before returning successfully:
+
+- the Meta health endpoint returns HTTP 200;
+- the Holder emits `LOCAL_HOLDER_READY` and reports a nonzero
+  `cpu.total_bytes`;
+- the SGLang launcher remains alive during initialization;
+- `http://127.0.0.1:30000/health_generate` returns HTTP 200.
+
+Each run gets a new directory under
+`/home/l00951280/dsv4-l3-results/local-stack-<timestamp>`. The stable symlink
+`/home/l00951280/dsv4-l3-results/latest-local-stack` points to the latest
+successful run. Override paths or capacity with environment variables when
+needed:
+
+```bash
+SGLANG_DIR=/path/to/sglang \
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-w8a8-mtp \
+RESULT_ROOT=/data/dsv4-l3-results \
+HOLDER_CAPACITY=224GB \
+bash "$TOOLS_DIR/restart_local_stack_128k.sh"
+```
+
+If any stage fails, the script stops the partial stack and prints the tail of
+the Meta, Holder, and SGLang logs. The manual commands below remain useful for
+debugging individual stages.
 
 Start the metadata service first:
 
