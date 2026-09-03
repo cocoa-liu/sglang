@@ -154,25 +154,29 @@ clear_l3_storage() {
   echo "[OK] L3 cleared: $output"
 }
 
-collect_cached_token_sum() {
+response_cached_token_sum() {
+  local client_log=$1
+  local stage=$2
+  local cached_sum
+
+  cached_sum=$(
+    sed -nE "s/.*\\[${stage}\\] cached_token_sum=([0-9]+).*/\\1/p" \
+      "$client_log" | tail -n 1
+  )
+  if [[ ! "$cached_sum" =~ ^[0-9]+$ ]]; then
+    echo "[FAIL] no cached-token total in generate responses: $client_log" >&2
+    return 1
+  fi
+  printf '%s\n' "$cached_sum"
+}
+
+capture_server_window() {
   local start_line=$1
   local output_file=$2
-  local expected_sum=$3
-  local cached_sum=0
 
-  for _ in $(seq 1 30); do
-    tail -n "+$((start_line + 1))" "$SERVER_LOG" >"$output_file"
-    cached_sum=$(
-      sed -nE 's/.*#cached-token: ([0-9]+).*/\1/p' "$output_file" \
-        | awk '{sum += $1} END {print sum + 0}'
-    )
-    if (( cached_sum >= expected_sum )); then
-      break
-    fi
-    sleep 1
-  done
-
-  printf '%s\n' "$cached_sum"
+  # Server logs are auxiliary evidence only. /generate response metadata is
+  # synchronous and is the authoritative cache-hit signal for this test.
+  tail -n "+$((start_line + 1))" "$SERVER_LOG" >"$output_file"
 }
 
 echo "=== DeepSeek V4 MemCache L3 accuracy test ==="
@@ -241,8 +245,8 @@ if [[ ! -s "$FIRST_OUT" ]]; then
 fi
 
 L1_WINDOW="${RESULT_DIR}/server-l1-baseline-window.log"
-L1_CACHED_TOKEN_SUM=$(collect_cached_token_sum \
-  "$BASELINE_LOG_START_LINE" "$L1_WINDOW" "$EXPECTED_CACHED_TOKEN_SUM")
+capture_server_window "$BASELINE_LOG_START_LINE" "$L1_WINDOW"
+L1_CACHED_TOKEN_SUM=$(response_cached_token_sum "$BASELINE_LOG" populate)
 if (( L1_CACHED_TOKEN_SUM != EXPECTED_CACHED_TOKEN_SUM )); then
   echo "[FAIL] resident-cache baseline did not use the expected cache boundary" >&2
   echo "expected_cached_token_sum=$EXPECTED_CACHED_TOKEN_SUM" >&2
@@ -278,9 +282,8 @@ python3 -u "$BENCH_SCRIPT" \
   2>&1 | tee "$L1_CONTROL_LOG"
 
 L1_CONTROL_WINDOW="${RESULT_DIR}/server-l1-control-window.log"
-L1_CONTROL_CACHED_TOKEN_SUM=$(collect_cached_token_sum \
-  "$L1_CONTROL_LOG_START_LINE" "$L1_CONTROL_WINDOW" \
-  "$EXPECTED_CACHED_TOKEN_SUM")
+capture_server_window "$L1_CONTROL_LOG_START_LINE" "$L1_CONTROL_WINDOW"
+L1_CONTROL_CACHED_TOKEN_SUM=$(response_cached_token_sum "$L1_CONTROL_LOG" replay)
 if (( L1_CONTROL_CACHED_TOKEN_SUM != EXPECTED_CACHED_TOKEN_SUM )); then
   echo "[FAIL] resident-cache control did not use the expected cache boundary" >&2
   echo "expected_cached_token_sum=$EXPECTED_CACHED_TOKEN_SUM" >&2
@@ -331,8 +334,8 @@ python3 -u "$BENCH_SCRIPT" \
   2>&1 | tee "$REPLAY_LOG"
 
 L3_WINDOW="${RESULT_DIR}/server-replay-window.log"
-L3_CACHED_TOKEN_SUM=$(collect_cached_token_sum \
-  "$REPLAY_LOG_START_LINE" "$L3_WINDOW" "$EXPECTED_CACHED_TOKEN_SUM")
+capture_server_window "$REPLAY_LOG_START_LINE" "$L3_WINDOW"
+L3_CACHED_TOKEN_SUM=$(response_cached_token_sum "$REPLAY_LOG" replay)
 if (( L3_CACHED_TOKEN_SUM != EXPECTED_CACHED_TOKEN_SUM )); then
   echo "[FAIL] L3 replay did not use the expected cache boundary" >&2
   echo "expected_cached_token_sum=$EXPECTED_CACHED_TOKEN_SUM" >&2

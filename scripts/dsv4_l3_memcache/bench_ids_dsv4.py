@@ -208,6 +208,7 @@ def main():
 
     def _populate():
         t0 = time.perf_counter()
+        cached_token_sum = 0
         with ThreadPoolExecutor(max_workers=a.pop_conc) as ex:
             futs = [
                 ex.submit(_post_generate, pop_inputs[i], f"{a.tag}-pop-{i}",
@@ -216,14 +217,16 @@ def main():
             ]
             for i, f in enumerate(futs):
                 try:
-                    out, _ = f.result()
+                    out, cached_tokens = f.result()
                     first_out[i] = out
+                    cached_token_sum += int(cached_tokens or 0)
                 except Exception as e:
                     print(f"  [populate] [{i}] FAILED: {e!r}")
                     raise
                 if (i + 1) % a.pop_conc == 0:
                     print(f"  [populate] {i + 1}/{N} done ({time.perf_counter() - t0:.0f}s)")
         print(f"  [populate] {N} prefixes done in {time.perf_counter() - t0:.0f}s")
+        print(f"  [populate] cached_token_sum={cached_token_sum}")
 
     def _measure():
         # roundrobin: pin routed_dp_rank on the native-bench measure too, so each
@@ -273,6 +276,7 @@ def main():
     def _replay():
         bad = 0
         diverged = []
+        cached_token_sum = 0
         with ThreadPoolExecutor(max_workers=a.pop_conc) as ex:
             futs = [
                 ex.submit(_post_generate, pop_inputs[i], f"{a.tag}-replay-{i}",
@@ -282,6 +286,7 @@ def main():
             for i, f in enumerate(futs):
                 try:
                     out, cac = f.result()
+                    cached_token_sum += int(cac or 0)
                 except Exception as e:
                     print(f"  [replay] [{i}] FAILED: {e!r}")
                     raise
@@ -311,6 +316,7 @@ def main():
             print(f"  [replay] [{i}] DIVERGED at tok#{idx}: first={first_cmp} "
                   f"replay={replay_cmp} cached={cac}")
         print(f"  [replay] {N - bad}/{N} identical (cached check done)")
+        print(f"  [replay] cached_token_sum={cached_token_sum}")
         if bad:
             print(f"  [replay] NOTE: {bad} outputs diverged (recorded, cell continues)")
 

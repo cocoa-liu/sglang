@@ -310,6 +310,11 @@ l1_control_cached_token_sum=4128768
 l3_cached_token_sum=4128768
 ```
 
+The cached-token totals are taken directly from each synchronous `/generate`
+response's `meta_info.cached_tokens`. The captured server-log windows are
+auxiliary diagnostics and are not used as the pass/fail source, because server
+log output can be buffered or point at an older launch log.
+
 The same-boundary accuracy wrapper currently supports `100` mode only. Use the
 performance matrix scripts for 50% hit-rate measurements.
 
