@@ -358,6 +358,33 @@ The bundled Meta configuration keeps eviction at the MemCache 1.2 defaults
 (high 90%, low 80%). Its default DRAM rewarm watermark is 95% and must remain
 strictly greater than the high eviction watermark.
 
+## Compare L1, L2, and L3 performance
+
+`bench_cache_tiers.py` measures the same deterministic prefix from each cache
+tier. It first repeats the prefix while it is device-resident (L1), inserts one
+same-sized filler prefix per DP rank to demote it to the host pool (L2), then
+flushes the local tiers and reloads it from MemCache (L3). Every measured
+request is rejected unless `cached_tokens_details` names only the expected
+tier.
+
+The validated DeepSeek-V4-Flash service reports a maximum request input of
+52,474 tokens, so the default workload uses 48K tokens:
+
+```bash
+mkdir -p "$RESULT_DIR/cache-tier-perf"
+python3 "$TOOLS_DIR/bench_cache_tiers.py" \
+  --base-url http://127.0.0.1:30000 \
+  --input-length 49152 --dp-ranks 8 \
+  --filler-count 1 --rounds 5 \
+  --output "$RESULT_DIR/cache-tier-perf/48k-8dp-5rounds.json"
+```
+
+With one generated token, request latency closely represents TTFT. The output
+also records server E2E latency and aggregate input throughput. Do not increase
+the filler count without rechecking the tier metadata: under this topology two
+48K fillers can evict the target from both local tiers and turn the intended L2
+sample into an L3 sample.
+
 ## Stop the processes
 
 Stop only the processes recorded by this run. An NPU reset is not part of the
