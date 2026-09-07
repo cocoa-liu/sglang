@@ -19,6 +19,7 @@ NPU_DEVICES=${NPU_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 TP_SIZE=${TP_SIZE:-16}
 DP_SIZE=${DP_SIZE:-$TP_SIZE}
 MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-$DP_SIZE}
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.60}
 RUN_E=${1:?usage: run_server_128k.sh RESULT_DIR}
 mkdir -p "$RUN_E"
 RUN_E=$(cd "$RUN_E" && pwd)
@@ -63,7 +64,7 @@ python3 -m sglang.launch_server \
   --attention-backend ascend --watchdog-timeout 9000 \
   --disable-cuda-graph \
   --host 0.0.0.0 --port "$SERVER_PORT" --nccl-port "$NCCL_PORT" \
-  --mem-fraction-static 0.60 --swa-full-tokens-ratio 0.5 \
+  --mem-fraction-static "$MEM_FRACTION_STATIC" --swa-full-tokens-ratio 0.5 \
   --prefill-max-requests 1 --chunked-prefill-size 32768 \
   --max-running-requests "$MAX_RUNNING_REQUESTS" \
   --dp-size "$DP_SIZE" --enable-dp-attention \

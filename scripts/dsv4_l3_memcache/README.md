@@ -328,6 +328,7 @@ Holder):
 TP_SIZE=8 DP_SIZE=8 MEMCACHE_WORLD_SIZE=9 \
 NPU_DEVICES=8,9,10,11,12,13,14,15 \
 HOLDER_CAPACITY=64GB \
+MEM_FRACTION_STATIC=0.85 \
 MODEL_PATH=/mnt/paas/weights/DeepSeek-V4-Flash-0731-w8a8 \
 bash "$TOOLS_DIR/restart_local_stack_128k.sh"
 ```
