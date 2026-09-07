@@ -318,6 +318,36 @@ log output can be buffered or point at an older launch log.
 The same-boundary accuracy wrapper currently supports `100` mode only. Use the
 performance matrix scripts for 50% hit-rate measurements.
 
+## GSM8K accuracy through MemCache L3
+
+For the 8-device DeepSeek-V4 Flash topology, start the local stack with eight
+DP/TP ranks and a nine-member MemCache world (eight SGLang clients plus one
+Holder):
+
+```bash
+TP_SIZE=8 DP_SIZE=8 MEMCACHE_WORLD_SIZE=9 \
+NPU_DEVICES=8,9,10,11,12,13,14,15 \
+HOLDER_CAPACITY=64GB \
+MODEL_PATH=/mnt/paas/weights/DeepSeek-V4-Flash-0731-w8a8 \
+bash "$TOOLS_DIR/restart_local_stack_128k.sh"
+```
+
+Then run the deterministic 20-shot GSM8K comparison. The first pass establishes
+the model accuracy and writes the shared prompt prefixes to L3. The wrapper
+flushes L1/L2 without clearing L3, repeats the same dataset, and requires both
+scores to be at least 0.90, score drift at most 0.03, no failed requests, and a
+non-zero `cached_tokens_details.storage` total:
+
+```bash
+MODEL_PATH=/mnt/paas/weights/DeepSeek-V4-Flash-0731-w8a8 \
+NUM_EXAMPLES=500 NUM_THREADS=64 \
+bash "$TOOLS_DIR/test_l3_gsm8k_accuracy.sh"
+```
+
+Use `GSM8K_DATA_PATH=/path/to/test.jsonl` to avoid downloading the public test
+set. Result JSON and logs are written below
+`/home/l00951280/dsv4-l3-results/gsm8k` by default.
+
 ## Stop the processes
 
 Stop only the processes recorded by this run. An NPU reset is not part of the

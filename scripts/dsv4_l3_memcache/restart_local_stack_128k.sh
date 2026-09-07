@@ -18,6 +18,9 @@ NCCL_PORT=${NCCL_PORT:-34001}
 HOLDER_CAPACITY=${HOLDER_CAPACITY:-224GB}
 HOLDER_DEVICE_ID=${HOLDER_DEVICE_ID:-0}
 MEMCACHE_WORLD_SIZE=${MEMCACHE_WORLD_SIZE:-17}
+TP_SIZE=${TP_SIZE:-16}
+DP_SIZE=${DP_SIZE:-$TP_SIZE}
+NPU_DEVICES=${NPU_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 META_HEALTH_URL=${META_HEALTH_URL:-http://127.0.0.1:8000/health}
 CAPACITY_URL=${CAPACITY_URL:-http://127.0.0.1:8000/api/v1/capacity/usage}
 SERVER_HEALTH_URL=${SERVER_HEALTH_URL:-http://127.0.0.1:${SERVER_PORT}/health_generate}
@@ -242,6 +245,19 @@ stop_stack
 
 cp -- "$META_CONFIG_SOURCE" "$META_CONFIG"
 cp -- "$MEMCACHE_CONFIG_SOURCE" "$MEMCACHE_CONFIG"
+python3 - "$MEMCACHE_CONFIG" "$MEMCACHE_WORLD_SIZE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+world_size = int(sys.argv[2])
+with open(path, encoding="utf-8") as file:
+    config = json.load(file)
+config["world_size"] = world_size
+with open(path, "w", encoding="utf-8") as file:
+    json.dump(config, file, indent=2)
+    file.write("\n")
+PY
 git -C "$SGLANG_DIR" rev-parse HEAD >"$RESULT_DIR/sglang-commit.txt"
 git -C "$(cd "$SCRIPT_DIR/../.." && pwd)" rev-parse HEAD \
   >"$RESULT_DIR/tools-commit.txt"
@@ -271,6 +287,9 @@ MODEL_PATH="$MODEL_PATH" \
 MEMCACHE_CONFIG="$MEMCACHE_CONFIG" \
 SERVER_PORT="$SERVER_PORT" \
 NCCL_PORT="$NCCL_PORT" \
+TP_SIZE="$TP_SIZE" \
+DP_SIZE="$DP_SIZE" \
+NPU_DEVICES="$NPU_DEVICES" \
 SGLANG_DSV4_L3_DIAGNOSTICS="${SGLANG_DSV4_L3_DIAGNOSTICS:-0}" \
   bash "$SCRIPT_DIR/run_server_128k.sh" "$RESULT_DIR/server"
 
@@ -288,5 +307,5 @@ printf 'HOLDER_PID=%s\n' "$HOLDER_PID"
 printf 'SERVER_PID=%s\n' "$SERVER_PID"
 printf 'SERVER_LOG=%q\n' "$SERVER_LOG"
 printf 'Run the accuracy test with:\n'
-printf '  DP_RANKS=16 SERVER_LOG=%q bash %q 131072 32 100\n' \
-  "$SERVER_LOG" "$SCRIPT_DIR/test_l3_accuracy.sh"
+printf '  DP_RANKS=%s SERVER_LOG=%q bash %q 131072 32 100\n' \
+  "$DP_SIZE" "$SERVER_LOG" "$SCRIPT_DIR/test_l3_accuracy.sh"

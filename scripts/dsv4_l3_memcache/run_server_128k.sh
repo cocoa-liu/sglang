@@ -15,6 +15,10 @@ MODEL_PATH=${MODEL_PATH:-/mnt/paas/weights/DeepSeek-V4-Flash-w8a8-mtp}
 MEMCACHE_CONFIG=${MEMCACHE_CONFIG:-$SCRIPT_DIR/local_memcache.example.json}
 SERVER_PORT=${SERVER_PORT:-30000}
 NCCL_PORT=${NCCL_PORT:-34001}
+NPU_DEVICES=${NPU_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+TP_SIZE=${TP_SIZE:-16}
+DP_SIZE=${DP_SIZE:-$TP_SIZE}
+MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-$DP_SIZE}
 RUN_E=${1:?usage: run_server_128k.sh RESULT_DIR}
 mkdir -p "$RUN_E"
 RUN_E=$(cd "$RUN_E" && pwd)
@@ -25,7 +29,7 @@ RUN_E=$(cd "$RUN_E" && pwd)
 export ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH:-}
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export ASCEND_RT_VISIBLE_DEVICES="$NPU_DEVICES"
 export PYTHONPATH=$SGLANG_DIR/python:/sgl-workspace/sglang/python:${PYTHONPATH:-}
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export FORCE_DRAFT_MODEL_NON_QUANT=1
@@ -55,13 +59,14 @@ export STREAMS_PER_DEVICE=32
 cd "$SGLANG_DIR"
 python3 -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
-  --page-size 128 --tp-size 16 --trust-remote-code --device npu \
+  --page-size 128 --tp-size "$TP_SIZE" --trust-remote-code --device npu \
   --attention-backend ascend --watchdog-timeout 9000 \
   --disable-cuda-graph \
   --host 0.0.0.0 --port "$SERVER_PORT" --nccl-port "$NCCL_PORT" \
   --mem-fraction-static 0.60 --swa-full-tokens-ratio 0.5 \
   --prefill-max-requests 1 --chunked-prefill-size 32768 \
-  --max-running-requests 16 --dp-size 16 --enable-dp-attention \
+  --max-running-requests "$MAX_RUNNING_REQUESTS" \
+  --dp-size "$DP_SIZE" --enable-dp-attention \
   --moe-a2a-backend deepep --deepep-mode normal \
   --quantization modelslim --enable-dp-lm-head \
   --kv-cache-dtype auto --random-seed 20260807 --context-length 264448 \
