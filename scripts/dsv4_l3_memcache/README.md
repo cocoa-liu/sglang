@@ -328,10 +328,15 @@ Holder):
 TP_SIZE=8 DP_SIZE=8 MEMCACHE_WORLD_SIZE=9 \
 NPU_DEVICES=8,9,10,11,12,13,14,15 \
 HOLDER_CAPACITY=64GB \
-MEM_FRACTION_STATIC=0.85 \
+MEM_FRACTION_STATIC=0.78 \
 MODEL_PATH=/mnt/paas/weights/DeepSeek-V4-Flash-0731-w8a8 \
 bash "$TOOLS_DIR/restart_local_stack_128k.sh"
 ```
+
+`0.78` is intentionally close to the minimum KV-cache requirement for this
+model (`>0.761` in the validated image), while leaving NPU memory for operator
+workspaces. `0.85` can initialize the cache but may OOM during the first
+concurrent GSM8K batch.
 
 Then run the deterministic 20-shot GSM8K comparison. The first pass establishes
 the model accuracy and writes the shared prompt prefixes to L3. The wrapper
