@@ -348,6 +348,10 @@ Use `GSM8K_DATA_PATH=/path/to/test.jsonl` to avoid downloading the public test
 set. Result JSON and logs are written below
 `/home/l00951280/dsv4-l3-results/gsm8k` by default.
 
+The bundled Meta configuration keeps eviction at the MemCache 1.2 defaults
+(high 90%, low 80%). Its default DRAM rewarm watermark is 95% and must remain
+strictly greater than the high eviction watermark.
+
 ## Stop the processes
 
 Stop only the processes recorded by this run. An NPU reset is not part of the
