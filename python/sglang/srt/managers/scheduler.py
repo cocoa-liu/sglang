@@ -538,6 +538,10 @@ class Scheduler(
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
+        # Establish DSV4's HCCL communication domain before a HiCache backend
+        # initializes another NPU RoCE transport such as MemFabric device_rdma.
+        self.maybe_init_hccl_dp_prewarm()
+
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
@@ -578,7 +582,6 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
         self.emit_metrics_constants()
-        self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -4267,9 +4270,11 @@ class Scheduler(
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
-            self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
-            if_success = True
+            if_success = self.tree_cache.clear_storage_backend()
+            if if_success:
+                logger.info("Hierarchical cache cleared successfully!")
+            else:
+                logger.warning("Failed to clear hierarchical cache storage backend.")
         else:
             logging.warning("Hierarchical cache is not enabled.")
             if_success = False
