@@ -153,7 +153,7 @@ def resolve_layout_io_compatibility(server_args: Any):
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if (
-        cfg.hicache_storage_backend != "mooncake"
+        cfg.hicache_storage_backend not in ("mooncake", "ascend_memcache")
         or cfg.hicache_mem_layout != "layer_first"
     ):
         return
@@ -162,6 +162,10 @@ def resolve_storage_layout_compatibility(server_args: Any):
         new_layout = "page_first_direct"
     elif cfg.hicache_io_backend == "kernel":
         new_layout = "page_first"
+    elif cfg.hicache_io_backend == "kernel_ascend":
+        new_layout = (
+            "page_first_kv_split" if use_mla_backend(server_args) else "page_first_direct"
+        )
     else:
         # Keep current behavior for unknown backends (e.g., kernel_ascend).
         new_layout = cfg.hicache_mem_layout
@@ -172,7 +176,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
         hicache_mem_layout=new_layout,
     )
     logger.warning(
-        f"Mooncake storage backend does not support layer_first layout, "
+        f"Mooncake/Ascend MemCache storage backends do not support layer_first layout, "
         f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
     )
 
