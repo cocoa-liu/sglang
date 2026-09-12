@@ -2,9 +2,14 @@ import ctypes
 import threading
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import pytest
 import torch
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    STORAGE_BATCH_SIZE,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
     C128SidecarComponent,
@@ -30,6 +35,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
     PrepareLoadBackResult,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 class _FakeObjectStore:
@@ -96,6 +102,7 @@ class _LifecycleObjectStore:
 def _make_memcache(existing=()):
     backend = AscendMemcacheStore.__new__(AscendMemcacheStore)
     backend.store = _FakeObjectStore(existing)
+    backend._store_initialized = True
     backend.mem_pool_host = SimpleNamespace(kv_buffer=None)
     backend.registered_pools = {}
     backend.mla_suffix = ""
@@ -469,46 +476,24 @@ def test_partial_prefix_trims_coarse_buffer_and_releases_tail():
     assert torch.equal(released[0].host_indices, torch.arange(16, 32))
 
 
-def test_indexer_k_and_scale_use_independent_pool_metadata():
-    backend = _make_memcache()
-
-    class _Pool:
-        def get_page_buffer_meta(self, indices):
-            return [10, 20], [100, 100]
-
-    class _ScalePool:
-        def get_page_buffer_meta(self, indices):
-            return [11, 21], [4, 4]
-
-    ptrs, sizes = backend._get_transfer_buffer_meta(
-        _Pool(),
-        PoolTransfer(name=PoolName.DEEPSEEK_V4_C4_INDEXER),
-        torch.arange(64),
-    )
-
-    scale_ptrs, scale_sizes = backend._get_transfer_buffer_meta(
-        _ScalePool(),
-        PoolTransfer(name=PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE),
-        torch.arange(64),
-    )
-
-    assert ptrs == [10, 20]
-    assert sizes == [100, 100]
-    assert scale_ptrs == [11, 21]
-    assert scale_sizes == [4, 4]
-
-
-def test_storage_projection_compacts_c4_indices():
+@pytest.mark.parametrize(
+    "name",
+    [
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+    ],
+)
+def test_storage_derived_pools_reuse_logical_anchor_indices(name):
     anchor = torch.cat((torch.arange(128), torch.arange(256, 384)))
-
-    projected = HybridCacheController._project_anchor_indices_for_storage(
-        anchor, anchor_page_size=128, target_page_size=32
+    transfer = PoolTransfer(name=name, indices_from_pool=PoolName.KV)
+    operation = SimpleNamespace(
+        host_indices=anchor, hash_value=["h0", "h1"], pool_transfers=[transfer]
     )
-
-    assert torch.equal(
-        projected,
-        torch.cat((torch.arange(32), torch.arange(64, 96))),
-    )
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+    assert transfer.host_indices is anchor
+    assert transfer.keys == operation.hash_value
 
 
 def test_refactored_indexer_pools_round_trip_independently():
@@ -575,6 +560,120 @@ def test_virtual_anchor_prefetch_skips_primary_io_and_loads_real_pool():
         ack.pool_hits and ack.pool_hits.get(PoolName.DEEPSEEK_V4_C128.value, 0) == 1
         for ack in acks
     )
+
+
+@pytest.mark.parametrize(
+    "failed_pool",
+    [
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+    ],
+)
+def test_logical_anchor_rejects_failed_derived_read(failed_pool):
+    transfers = [
+        PoolTransfer(name=failed_pool, keys=["h0"], indices_from_pool=PoolName.KV),
+        PoolTransfer(name=PoolName.SWA, keys=["h0"]),
+    ]
+    operation = PrefetchOperation("req", list(range(128)), pool_transfers=transfers)
+    operation.completed_tokens = 128
+    operation.pool_transfers_done = True
+    operation.pool_storage_result.update_extra_pool_hit_pages(
+        {failed_pool: 0, PoolName.SWA: 1}
+    )
+    release = Mock()
+    cache = SimpleNamespace(
+        page_size=128,
+        cache_controller=SimpleNamespace(
+            mem_pool_host=SimpleNamespace(kv_buffer=None),
+            append_host_mem_release=release,
+            prefetch_tokens_occupied=128,
+        ),
+        storage_existence_cache=SimpleNamespace(invalidate_beyond=Mock()),
+        _finish_storage_prefetch=Mock(),
+        buffer_pipeline=None,
+        ongoing_prefetch={"req": operation},
+        _prefetch_occupied_span=lambda *_: 128,
+        prefetch_loaded_tokens_by_reqid={},
+        prefetch_loaded_storage_start_by_reqid={},
+    )
+    assert not UnifiedRadixCache._check_hybrid_prefetch_result(
+        cache,
+        "req",
+        operation,
+        128,
+        ["h0"],
+        torch.arange(128),
+        None,
+        None,
+        list(range(128)),
+    )
+    release.assert_called_once()
+    assert cache.prefetch_loaded_tokens_by_reqid["req"] == 0
+
+
+def test_sidecar_exception_preserves_ack_sequence():
+    def run(fail):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size = 128
+        controller.mem_pool_host = SimpleNamespace(kv_buffer=None)
+        controller.prefetch_sync_queue = Queue()
+        controller.prefetch_buffer = Queue()
+        controller.storage_stop_event = _OneIterationStopEvent()
+        controller.storage_backend = SimpleNamespace(
+            batch_get_v2=Mock(
+                side_effect=RuntimeError("injected read failure") if fail else None,
+                return_value={PoolName.SWA: [True]},
+            )
+        )
+        operation = PrefetchOperation(
+            "req",
+            list(range(128)),
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.SWA, keys=["h0"], host_indices=torch.arange(128)
+                )
+            ],
+        )
+        operation.hash_value = ["h0"]
+        operation.host_indices = torch.arange(128)
+        controller.prefetch_buffer.put(operation)
+        controller.prefetch_io_aux_func()
+        return list(controller.prefetch_sync_queue.queue)
+
+    success, failure = run(False), run(True)
+
+    def signature(acks):
+        return [
+            (
+                a.completed_tokens is not None,
+                a.pool_hits is not None,
+                bool(a.completed_req),
+            )
+            for a in acks
+        ]
+
+    assert (
+        signature(success)
+        == signature(failure)
+        == [(True, False, False), (False, True, False), (False, False, True)]
+    )
+    assert failure[1].pool_hits == {}
+
+
+def test_kv_exception_preserves_remaining_progress_acks():
+    controller = HiCacheController.__new__(HiCacheController)
+    controller.page_size = 128
+    controller.prefetch_sync_queue = Queue()
+    controller._page_transfer_kv_batch = Mock(side_effect=RuntimeError("read failed"))
+    pages = STORAGE_BATCH_SIZE + 1
+    operation = PrefetchOperation("req", list(range(pages * 128)))
+    operation.hash_value = [f"h{i}" for i in range(pages)]
+    operation.host_indices = torch.arange(pages * 128)
+    assert controller._page_transfer(operation) == 0
+    acks = list(controller.prefetch_sync_queue.queue)
+    assert [a.completed_tokens for a in acks] == [0, 0]
+    controller._page_transfer_kv_batch.assert_called_once()
 
 
 class _OneIterationStopEvent:
