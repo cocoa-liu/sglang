@@ -21,6 +21,7 @@ from typing import Any, List, Optional, Tuple
 
 import requests
 import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
@@ -273,10 +274,6 @@ class AscendMemcacheStore(HiCacheStorage):
         actual_pool_names.update(str(name) for name in (host_pool_names or ()))
         return not actual_pool_names.isdisjoint(dsv4_pool_names)
 
-    def _is_store_initialized(self) -> bool:
-        # Keep helpers built with __new__ in focused unit tests compatible.
-        return getattr(self, "_store_initialized", self.store is not None)
-
     def _register_buffer_meta(self, ptr: int, size: int) -> None:
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
@@ -287,10 +284,10 @@ class AscendMemcacheStore(HiCacheStorage):
 
     def _ensure_initialized(self) -> None:
         """Initialize BM/HYBM once and then register every deferred host buffer."""
-        if self._is_store_initialized():
+        if self._store_initialized:
             return
         with self._store_init_lock:
-            if self._is_store_initialized():
+            if self._store_initialized:
                 return
             store = self._store_factory()
             try:
@@ -386,7 +383,7 @@ class AscendMemcacheStore(HiCacheStorage):
             # local HBM. Host H2G/G2H I/O does not require registration (matching
             # MemCache's CPU tensor examples); registering it corrupts SDMA data.
             return
-        if not self._is_store_initialized():
+        if not self._store_initialized:
             buffer_meta = (ptr, size)
             if buffer_meta not in self._pending_buffers:
                 self._pending_buffers.append(buffer_meta)
@@ -700,9 +697,7 @@ class AscendMemcacheStore(HiCacheStorage):
                     f"Unsupported hybrid pool for Memcache: {transfer.name}"
                 )
 
-            ptr_list, element_size_list = self._get_transfer_buffer_meta(
-                host_pool, transfer, host_indices
-            )
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             if not (len(key_strs) == len(ptr_list) == len(element_size_list)):
                 raise ValueError(
                     f"PoolTransfer '{transfer.name}' physical object mismatch: "
@@ -734,10 +729,6 @@ class AscendMemcacheStore(HiCacheStorage):
             )
             results[transfer.name] = pool_results
         return results
-
-    def _get_transfer_buffer_meta(self, host_pool, transfer, host_indices):
-        # Refactored DSV4 exposes indexer K and scale as independent pools.
-        return host_pool.get_page_buffer_meta(host_indices)
 
     def batch_get_v2(
         self,
@@ -1085,7 +1076,7 @@ class AscendMemcacheStore(HiCacheStorage):
         resources whose early initialization the lazy lifecycle is designed to
         avoid.
         """
-        if self._is_store_initialized():
+        if self._store_initialized:
             result = self.store.remove_all()
         else:
             clear_client = self._store_factory()
@@ -1150,7 +1141,7 @@ class AscendMemcacheStore(HiCacheStorage):
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        if not self._is_store_initialized():
+        if not self._store_initialized:
             return [-1] * len(key_strs)
         io_ptrs = buffer_ptrs
         staging_buffers = None
@@ -1186,7 +1177,7 @@ class AscendMemcacheStore(HiCacheStorage):
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         if not key_strs:
             return []
-        if not self._is_store_initialized():
+        if not self._store_initialized:
             return [0] * len(key_strs)
         raw = self.store.batch_is_exist(key_strs)
         if len(raw) != len(key_strs):

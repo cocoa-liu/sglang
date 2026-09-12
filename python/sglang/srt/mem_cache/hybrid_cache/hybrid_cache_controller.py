@@ -10,13 +10,16 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
+
 from sglang.srt.managers.cache_controller import (
     CacheOperation,
-    LayerDoneCounter,
-    PrefetchAck,
 )
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
+)
+from sglang.srt.managers.cache_controller import (
+    LayerDoneCounter,
+    PrefetchAck,
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
@@ -696,12 +699,19 @@ class HybridCacheController(BaseHiCacheController):
                     if transfer.indices_from_pool != PoolName.KV
                 ]
             )
-            self._sync_trailing_keys(
-                transfers_nonkv, operation.hash_value, kv_completed_pages
-            )
-            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(transfers_nonkv)
-            pool_hits = count_pool_hits(results)
+            try:
+                self._sync_trailing_keys(
+                    transfers_nonkv, operation.hash_value, kv_completed_pages
+                )
+                self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+                results = self.storage_backend.batch_get_v2(transfers_nonkv)
+                pool_hits = count_pool_hits(results)
+            except Exception:
+                # Still emit the pool ACK below: peers reduce it before the
+                # terminal ACK. The scheduler discards the zero-hit result.
+                logger.exception(
+                    "HiCache sidecar prefetch %s failed.", operation.request_id
+                )
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.
@@ -874,59 +884,9 @@ class HybridCacheController(BaseHiCacheController):
                 if transfer.keys is None:
                     transfer.keys = source.keys
             else:
-                if transfer.name in (
-                    PoolName.DEEPSEEK_V4_C4,
-                    PoolName.DEEPSEEK_V4_C4_INDEXER,
-                ):
-                    entry = self.mem_pool_host.entry_map.get(transfer.name)
-                    if entry is None:
-                        raise RuntimeError(
-                            f"DSV4 storage pool is not registered: {transfer.name}."
-                        )
-                    transfer.host_indices = self._project_anchor_indices_for_storage(
-                        operation.host_indices,
-                        self.page_size,
-                        entry.host_pool.page_size,
-                    )
-                else:
-                    transfer.host_indices = operation.host_indices
+                transfer.host_indices = operation.host_indices
                 if transfer.keys is None:
                     transfer.keys = operation.hash_value
-
-    @staticmethod
-    def _project_anchor_indices_for_storage(
-        anchor_indices: torch.Tensor,
-        anchor_page_size: int,
-        target_page_size: int,
-    ) -> torch.Tensor:
-        """Project contiguous anchor pages to compact native side-pool pages."""
-        if anchor_page_size <= 0 or target_page_size <= 0:
-            raise ValueError("Storage page sizes must be positive.")
-        if anchor_indices.numel() % anchor_page_size != 0:
-            raise ValueError(
-                f"Anchor indices ({anchor_indices.numel()}) are not aligned to "
-                f"page size {anchor_page_size}."
-            )
-        if anchor_indices.numel() == 0:
-            return anchor_indices.new_empty((0,), dtype=torch.int64)
-        pages = anchor_indices.reshape(-1, anchor_page_size)
-        starts = pages[:, 0]
-        if torch.any(starts % anchor_page_size != 0):
-            raise ValueError("Anchor storage pages must start at a page boundary.")
-        expected = starts[:, None] + torch.arange(
-            anchor_page_size,
-            device=anchor_indices.device,
-            dtype=anchor_indices.dtype,
-        )
-        if not torch.equal(pages, expected):
-            raise ValueError("Anchor storage pages must contain contiguous indices.")
-        page_ids = starts // anchor_page_size
-        offsets = torch.arange(
-            target_page_size,
-            device=anchor_indices.device,
-            dtype=anchor_indices.dtype,
-        )
-        return (page_ids[:, None] * target_page_size + offsets).reshape(-1)
 
     def _sync_trailing_keys(
         self,

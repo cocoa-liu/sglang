@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import torch
 from numpy import float64
+
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,

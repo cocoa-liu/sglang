@@ -5,6 +5,7 @@ import threading
 from typing import Optional
 
 import torch
+
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
 )
@@ -674,7 +675,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 ptr_list.append(self.kv_buffer[int(row)].data_ptr())
             return ptr_list, [page_bytes] * len(ptr_list)
         raise ValueError(f"Unsupported layout: {self.layout}")
-
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         if self.layout not in ["page_first", "page_first_direct"]:

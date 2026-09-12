@@ -9,6 +9,7 @@ from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
+
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -2167,12 +2168,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Sync completed tokens and per-pool hit pages across ATTN groups, taking
         # the minimum so every rank agrees on the same usable prefix length.
         #
-        # Skip KV-derived pools, which do not report hits in operation.pool_storage_result.
-        # Their hit lengths are stored in completed_tokens.
+        # Physical KV includes derived-pool reads in completed_tokens. A logical
+        # anchor has no payload: every physical pool reports through pool_hits.
+        logical_anchor = self.cache_controller.mem_pool_host.kv_buffer is None
         pool_transfers = [
             transfer
             for transfer in operation.pool_transfers or []
-            if transfer.indices_from_pool != PoolName.KV
+            if logical_anchor or transfer.indices_from_pool != PoolName.KV
         ]
         hit_pages = (
             operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}

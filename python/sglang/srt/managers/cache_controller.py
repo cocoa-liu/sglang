@@ -22,6 +22,7 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
+
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -1075,13 +1076,20 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
-                hit_pages = self._page_transfer_kv_batch(
-                    operation,
-                    batch_hashes,
-                    batch_host_indices,
-                    extra_info,
-                    kv_derived_transfers,
-                )
+                try:
+                    hit_pages = self._page_transfer_kv_batch(
+                        operation,
+                        batch_hashes,
+                        batch_host_indices,
+                        extra_info,
+                        kv_derived_transfers,
+                    )
+                except Exception:
+                    # Preserve all remaining progress ACKs for peer reductions.
+                    logger.exception(
+                        "HiCache KV prefetch %s failed.", operation.request_id
+                    )
+                    hit_pages = 0
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False
