@@ -23,7 +23,6 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-
 from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -572,3 +571,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         refcount = getattr(self, "c128_page_refcount", None)
         if refcount is not None:
             refcount.zero_()
+        get_kvcache = getattr(self, "get_kvcache", None)
+        if get_kvcache is not None:
+            kvcache = get_kvcache()
+            clear_states = getattr(kvcache, "clear_all_c128_req_states", None)
+            if clear_states is not None:
+                clear_states()

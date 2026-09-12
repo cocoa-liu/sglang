@@ -5,7 +5,6 @@ from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple
 
 import torch
-
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4 import (
     clear_unaccepted_c128_draft_states,
@@ -1180,6 +1179,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 half = rows.shape[-1] // 2
                 rows[:, :half].zero_()
                 rows[:, half:].fill_(float("-inf"))
+
+    def clear_all_c128_req_states(self) -> None:
+        """Reset every request-scoped C128 state bank during a pool flush."""
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            pool.kv_score_buffer.clear()
 
     def clear_unaccepted_c128_draft_states(
         self,

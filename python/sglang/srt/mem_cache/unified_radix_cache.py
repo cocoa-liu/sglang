@@ -9,7 +9,6 @@ from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
-
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -34,7 +33,12 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -1832,7 +1836,18 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
         ).page_aligned(self.page_size)
+        anchor_node = self.tree_core.node_by_id(last_host_node_id)
         prefetch_length = len(prefetch_key)
+        for ct in self.tree_components:
+            if ct == BASE_COMPONENT_TYPE:
+                continue
+            prefetch_length = min(
+                prefetch_length,
+                self.components[ct].align_storage_prefetch_length(
+                    anchor_node, prefetch_length
+                ),
+            )
+        prefetch_key = prefetch_key[:prefetch_length]
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
             stats["attempts"] += 1
@@ -2550,8 +2565,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     hit_tokens,
                     available_size - (available_size % self.page_size),
                 )
-                if alloc_len >= self.prefetch_threshold:
-                    host_indices = cc.mem_pool_host.alloc(alloc_len)
+                # Only KV-derived, page-aligned sidecars can safely use a shorter
+                # prefix. Independent pools have already allocated buffers for
+                # the complete storage object set and must remain all-or-nothing.
+                clampable = not operation.pool_transfers or all(
+                    transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+                    and transfer.indices_from_pool == PoolName.KV
+                    for transfer in operation.pool_transfers
+                )
+                if clampable:
+                    if alloc_len >= self.prefetch_threshold:
+                        host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
                 if buffer_mode:
                     return False

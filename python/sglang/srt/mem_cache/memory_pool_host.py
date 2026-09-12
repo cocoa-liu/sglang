@@ -5,7 +5,6 @@ import threading
 from typing import Optional
 
 import torch
-
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
 )
@@ -91,8 +90,13 @@ class LogicalHostPool:
         self.num_release_slots = 0
 
     def destroy(self) -> None:
-        """Logical anchors own no backing buffers or registrations to release."""
-        return None
+        """Release logical allocator state during host-pool teardown."""
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
+        self.free_slots = torch.empty(0, dtype=torch.int64)
+        self.release_slots = []
+        self.num_release_slots = 0
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -670,6 +674,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 ptr_list.append(self.kv_buffer[int(row)].data_ptr())
             return ptr_list, [page_bytes] * len(ptr_list)
         raise ValueError(f"Unsupported layout: {self.layout}")
+
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         if self.layout not in ["page_first", "page_first_direct"]:

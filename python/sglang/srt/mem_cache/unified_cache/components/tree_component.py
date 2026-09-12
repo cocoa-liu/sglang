@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import torch
 from numpy import float64
-
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
@@ -668,6 +667,17 @@ class TreeComponent(ABC):
     ) -> PreparePrefetchResult:
         """Cache-level host pre-allocation before a prefetch builds its transfers."""
         return PreparePrefetchResult()
+
+    def align_storage_prefetch_length(
+        self, node: UnifiedTreeNode, prefetch_tokens: int
+    ) -> int:
+        """Return the storage-safe prefix length for this component.
+
+        Most components use the FULL page-aligned candidate unchanged. Components
+        with a coarser correctness boundary may shorten it before storage keys and
+        host allocations are created.
+        """
+        return prefetch_tokens
 
     def build_hicache_transfers(
         self,

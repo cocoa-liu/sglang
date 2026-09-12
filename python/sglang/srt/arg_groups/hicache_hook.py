@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
@@ -163,8 +164,13 @@ def resolve_storage_layout_compatibility(server_args: Any):
     elif cfg.hicache_io_backend == "kernel":
         new_layout = "page_first"
     elif cfg.hicache_io_backend == "kernel_ascend":
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
         new_layout = (
-            "page_first_kv_split" if use_mla_backend(server_args) else "page_first_direct"
+            "page_first_kv_split"
+            if use_mla_backend(server_args)
+            and not is_deepseek_v4(model_config_of(server_args).hf_config)
+            else "page_first_direct"
         )
     else:
         # Keep current behavior for unknown backends (e.g., kernel_ascend).

@@ -22,7 +22,6 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
-
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -144,6 +143,7 @@ class CacheOperation:
                 keys=[key for t in transfers if t.keys for key in t.keys] or None,
                 hit_policy=transfers[0].hit_policy,
                 indices_from_pool=transfers[0].indices_from_pool,
+                logical_pages_per_object=transfers[0].logical_pages_per_object,
             )
             for transfers in grouped.values()
         ]
@@ -745,6 +745,10 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            host_pool_names=tuple(
+                str(entry.name)
+                for entry in (getattr(self.mem_pool_host, "entries", None) or [])
+            ),
         )
 
     def reset(self):
