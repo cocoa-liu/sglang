@@ -80,9 +80,14 @@ python -m sglang.launch_server \
   --attention-backend ascend \
   --enable-hierarchical-cache \
   --hicache-storage-backend ascend_memcache \
-  --hicache-mem-layout page_first_kv_split \
+  --hicache-mem-layout page_first_direct \
   --hicache-storage-backend-extra-config '{"meta_service_url":"tcp://127.0.0.1:5000", "config_store_url":"tcp://127.0.0.1:6000", "log_level":"info", "world_size":256, "protocol": "device_sdma", "dram_size": "1GB"}'
 ```
+
+DeepSeek-V4 must use `page_first_direct`: its logical FULL anchor and independently
+paged C4/C128 host pools do not implement the generic MLA
+`page_first_kv_split` layout. When `layer_first` is supplied, ServerArgs resolves
+it to `page_first_direct` automatically for DeepSeek-V4.
 
 Pass LocalService options via `--hicache-storage-backend-extra-config` (JSON). Keys below match `memcache_hybrid.LocalConfig` field names.
 
