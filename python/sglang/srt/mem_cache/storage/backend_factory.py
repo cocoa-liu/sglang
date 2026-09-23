@@ -167,6 +167,9 @@ class StorageBackendFactory:
             return backend
         elif backend_name == "ascend_memcache":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "npu_memcache":
+            backend = backend_class(storage_config, mem_pool_host)
+            return backend
         elif backend_name == "aibrix":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
@@ -191,6 +194,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "shm":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "tensorcast":
+            return backend_class(storage_config)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -220,6 +225,12 @@ StorageBackendFactory.register_backend(
     "ascend_memcache",
     "sglang.srt.mem_cache.storage.ascend_memcache.ascend_memcache_store",
     "AscendMemcacheStore",
+)
+
+StorageBackendFactory.register_backend(
+    "npu_memcache",
+    "sglang.srt.mem_cache.storage.npu_memcache.npu_memcache_store",
+    "NpuMemcacheStore",
 )
 
 StorageBackendFactory.register_backend(
@@ -256,4 +267,10 @@ StorageBackendFactory.register_backend(
     "shm",
     "sglang.srt.mem_cache.storage.shm",
     "HiCacheShm",
+)
+
+StorageBackendFactory.register_backend(
+    "tensorcast",
+    "sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store",
+    "TensorcastStore",
 )

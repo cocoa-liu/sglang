@@ -35,7 +35,6 @@ from sglang.srt.mem_cache.unified_cache.components import (
     PreparePrefetchResult,
     TreeComponent,
 )
-from sglang.srt.mem_cache.utils import get_hash_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -332,6 +331,14 @@ class C128SidecarComponent(TreeComponent):
         ].clone()
         return cache_len + 1 if self.tree_core.is_eagle and cache_len > 0 else cache_len
 
+    def floor_cache_len(self, cache_len: int) -> int:
+        logical_len = cache_len
+        if self.tree_core.is_eagle and logical_len > 0:
+            logical_len -= 1
+        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
+        floored = logical_len // group_tokens * group_tokens
+        return floored + 1 if self.tree_core.is_eagle and floored > 0 else floored
+
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):
             for page_ids in action.indices:
@@ -419,20 +426,17 @@ class C128SidecarComponent(TreeComponent):
         if self._c128_kv_pool_host is None:
             return PreparePrefetchResult()
         page_size, group_tokens, _ = self._storage_geometry()
-        groups = prefetch_tokens // group_tokens
-        need_slots = groups * page_size
-        if need_slots == 0:
-            # A non-None empty tensor still builds a C128 transfer. Its exists
-            # result clamps a sub-group L3 prefix to zero instead of falsely
-            # publishing FULL/C4 data without the required C128 representation.
-            return PreparePrefetchResult(host_indices=torch.empty(0, dtype=torch.int64))
-        host_indices = self._c128_kv_pool_host.alloc(need_slots)
+        return PreparePrefetchResult(
+            staging_tokens=(prefetch_tokens // group_tokens) * page_size
+        )
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        assert self._c128_kv_pool_host is not None
+        host_indices = self._c128_kv_pool_host.alloc(num_tokens)
         if host_indices is None:
-            self.cache.evict_host(need_slots * 128, ComponentType.FULL)
-            host_indices = self._c128_kv_pool_host.alloc(need_slots)
-        if host_indices is None:
-            return PreparePrefetchResult(alloc_failed=True)
-        return PreparePrefetchResult(host_indices=host_indices)
+            self.cache.evict_host(num_tokens * 128, ComponentType.FULL)
+            host_indices = self._c128_kv_pool_host.alloc(num_tokens)
+        return host_indices
 
     def _storage_endpoint_keys(
         self, node: UnifiedTreeNode, groups: int, coverage: int
@@ -474,6 +478,7 @@ class C128SidecarComponent(TreeComponent):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
@@ -545,36 +550,19 @@ class C128SidecarComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            assert host_indices is not None
-            if host_indices.numel() % page_size != 0:
+            if staging_tokens % page_size != 0:
                 raise ValueError(
-                    "C128 prefetch host indices are not physical-page aligned: "
-                    f"slots={host_indices.numel()}, page_size={page_size}."
+                    "C128 prefetch staging is not physical-page aligned: "
+                    f"slots={staging_tokens}, page_size={page_size}."
                 )
-            groups = host_indices.numel() // page_size
+            groups = staging_tokens // page_size
             _, _, coverage = self._storage_geometry()
-            hashes = get_hash_str(
-                list(token_ids or []), last_hash, page_size=self.tree_core.page_size
-            )
-            if not isinstance(hashes, list):
-                raise TypeError("C128 storage prefetch requires page hash values.")
-            if len(hashes) != prefetch_tokens // self.tree_core.page_size:
-                raise ValueError(
-                    "C128 prefetch hash/token cardinality mismatch: "
-                    f"hashes={len(hashes)}, prefetch_tokens={prefetch_tokens}, "
-                    f"anchor_page_size={self.tree_core.page_size}."
-                )
-            keys = [hashes[i - 1] for i in range(coverage, len(hashes) + 1, coverage)]
-            if len(keys) != groups:
-                raise ValueError(
-                    "C128 prefetch key/host-group cardinality mismatch: "
-                    f"keys={len(keys)}, groups={groups}."
-                )
+            if groups * coverage != prefetch_tokens // self.tree_core.page_size:
+                raise ValueError("C128 prefetch staging/token cardinality mismatch.")
             return [
                 PoolTransfer(
                     name=PoolName.DEEPSEEK_V4_C128,
-                    host_indices=host_indices,
-                    keys=keys,
+                    keys=["__placeholder__"] * groups,
                     indices_from_pool=None,
                     logical_pages_per_object=coverage,
                 )

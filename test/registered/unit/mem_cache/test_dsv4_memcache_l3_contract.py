@@ -6,15 +6,15 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from sglang.srt.managers.cache_controller import (
-    HiCacheController,
-    STORAGE_BATCH_SIZE,
-)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
     C128SidecarComponent,
 )
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.managers.cache_controller import (
+    STORAGE_BATCH_SIZE,
+    HiCacheController,
+)
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, InsertResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -23,10 +23,13 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PPPrefetchPoolSpec,
+    PPPrefetchTicket,
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.ascend_memcache.ascend_memcache_store import (
     AscendMemcacheConfig,
     AscendMemcacheStore,
@@ -38,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     PrepareLoadBackResult,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 
 class _FakeObjectStore:
@@ -553,13 +557,16 @@ def test_host_group_dispatches_primary_io_by_anchor_pool(physical):
     controller.mem_pool_host = _make_host_group(physical)
     controller.storage_host_pool = controller.mem_pool_host.anchor_entry.host_pool
     controller.page_size = 128
+    controller.storage_backend_type = "ascend_memcache"
     controller.prefetch_sync_queue = Queue()
     controller._page_transfer_sidecar = Mock()
     controller.backup_skip = False
     controller.storage_backend = SimpleNamespace(prepare_for_backup=Mock())
-    operation = PrefetchOperation("req", list(range(128)), pool_transfers=[])
+    operation = PrefetchOperation(
+        CacheRequestHandle("req", 0), list(range(128)), pool_transfers=[]
+    )
     operation.hash_value = ["h0"]
-    assert not hasattr(controller.mem_pool_host, "kv_buffer")
+    assert controller.mem_pool_host.kv_buffer is controller.storage_host_pool.kv_buffer
     with patch.object(HiCacheController, "_page_transfer", return_value=1) as read:
         controller._page_transfer(operation)
         assert read.call_count == int(physical)
@@ -573,10 +580,11 @@ def test_virtual_anchor_prefetch_skips_primary_io_and_loads_real_pool():
     controller.page_size = 128
     controller.mem_pool_host = _make_host_group()
     controller.storage_host_pool = controller.mem_pool_host.anchor_entry.host_pool
+    controller.storage_backend_type = "ascend_memcache"
     controller.prefetch_sync_queue = Queue()
     calls = []
     controller.storage_backend = SimpleNamespace(
-        batch_get_v2=lambda transfers: (
+        batch_get_v2=lambda transfers, **kwargs: (
             calls.append(transfers) or {PoolName.DEEPSEEK_V4_C128: [True]}
         )
     )
@@ -585,7 +593,9 @@ def test_virtual_anchor_prefetch_skips_primary_io_and_loads_real_pool():
         host_indices=torch.arange(16),
         keys=["h15"],
     )
-    operation = PrefetchOperation("req", list(range(2048)), pool_transfers=[transfer])
+    operation = PrefetchOperation(
+        CacheRequestHandle("req", 0), list(range(2048)), pool_transfers=[transfer]
+    )
     operation.hash_value = [f"h{i}" for i in range(16)]
     operation.host_indices = torch.arange(2048)
 
@@ -616,7 +626,9 @@ def test_logical_anchor_rejects_failed_derived_read(failed_pool):
         PoolTransfer(name=failed_pool, keys=["h0"], indices_from_pool=PoolName.KV),
         PoolTransfer(name=PoolName.SWA, keys=["h0"]),
     ]
-    operation = PrefetchOperation("req", list(range(128)), pool_transfers=transfers)
+    operation = PrefetchOperation(
+        CacheRequestHandle("req", 0), list(range(128)), pool_transfers=transfers
+    )
     operation.completed_tokens = 128
     operation.pool_transfers_done = True
     operation.pool_storage_result.update_extra_pool_hit_pages(
@@ -635,14 +647,14 @@ def test_logical_anchor_rejects_failed_derived_read(failed_pool):
         storage_existence_cache=SimpleNamespace(invalidate_beyond=Mock()),
         _finish_storage_prefetch=Mock(),
         buffer_pipeline=None,
-        ongoing_prefetch={"req": operation},
+        ongoing_prefetch={operation.handle: operation},
         _prefetch_occupied_span=lambda *_: 128,
         prefetch_loaded_tokens_by_reqid={},
         prefetch_loaded_storage_start_by_reqid={},
     )
     assert not UnifiedRadixCache._check_hybrid_prefetch_result(
         cache,
-        "req",
+        operation.handle,
         operation,
         128,
         ["h0"],
@@ -652,7 +664,7 @@ def test_logical_anchor_rejects_failed_derived_read(failed_pool):
         list(range(128)),
     )
     release.assert_called_once()
-    assert cache.prefetch_loaded_tokens_by_reqid["req"] == 0
+    assert cache.prefetch_loaded_tokens_by_reqid[operation.handle] == 0
 
 
 def test_sidecar_exception_preserves_ack_sequence():
@@ -661,6 +673,7 @@ def test_sidecar_exception_preserves_ack_sequence():
         controller.page_size = 128
         controller.mem_pool_host = _make_host_group()
         controller.storage_host_pool = controller.mem_pool_host.anchor_entry.host_pool
+        controller.storage_backend_type = "ascend_memcache"
         controller.prefetch_sync_queue = Queue()
         controller.prefetch_buffer = Queue()
         controller.storage_stop_event = _OneIterationStopEvent()
@@ -671,7 +684,7 @@ def test_sidecar_exception_preserves_ack_sequence():
             )
         )
         operation = PrefetchOperation(
-            "req",
+            CacheRequestHandle("req", 0),
             list(range(128)),
             pool_transfers=[
                 PoolTransfer(
@@ -708,10 +721,13 @@ def test_sidecar_exception_preserves_ack_sequence():
 def test_kv_exception_preserves_remaining_progress_acks():
     controller = HiCacheController.__new__(HiCacheController)
     controller.page_size = 128
+    controller.storage_backend_type = "ascend_memcache"
     controller.prefetch_sync_queue = Queue()
     controller._page_transfer_kv_batch = Mock(side_effect=RuntimeError("read failed"))
     pages = STORAGE_BATCH_SIZE + 1
-    operation = PrefetchOperation("req", list(range(pages * 128)))
+    operation = PrefetchOperation(
+        CacheRequestHandle("req", 0), list(range(pages * 128))
+    )
     operation.hash_value = [f"h{i}" for i in range(pages)]
     operation.host_indices = torch.arange(pages * 128)
     assert controller._page_transfer(operation) == 0
@@ -733,13 +749,16 @@ def _run_one_hybrid_prefetch_worker(page_transfer):
     controller = HybridCacheController.__new__(HybridCacheController)
     controller.storage_stop_event = _OneIterationStopEvent()
     controller.prefetch_buffer = Queue()
+    controller.storage_backend_type = "ascend_memcache"
     controller.prefetch_sync_queue = Queue()
     controller._page_transfer = page_transfer
     controller.append_host_mem_release = lambda **_kwargs: (_ for _ in ()).throw(
         AssertionError("the scheduler, not the IO worker, owns prefetch release")
     )
 
-    operation = PrefetchOperation("req-terminal", list(range(128)))
+    operation = PrefetchOperation(
+        CacheRequestHandle("req-terminal", 0), list(range(128))
+    )
     operation.host_indices = torch.arange(128)
     controller.prefetch_buffer.put(operation)
     controller.prefetch_io_aux_func()
@@ -782,20 +801,17 @@ def test_c128_prefetch_transfer_uses_runtime_coverage():
     )
     component.tree_core = SimpleNamespace(page_size=128)
 
-    with patch(
-        "sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component.get_hash_str",
-        return_value=[f"h{i}" for i in range(16)],
-    ):
-        transfer = component.build_hicache_transfers(
-            SimpleNamespace(),
-            phase=CacheTransferPhase.PREFETCH,
-            host_indices=torch.arange(16),
-            token_ids=list(range(2048)),
-            prefetch_tokens=16 * 128,
-        )[0]
+    transfer = component.build_hicache_transfers(
+        SimpleNamespace(),
+        phase=CacheTransferPhase.PREFETCH,
+        staging_tokens=16,
+        token_ids=list(range(2048)),
+        prefetch_tokens=16 * 128,
+    )[0]
 
     assert transfer.name == PoolName.DEEPSEEK_V4_C128
-    assert transfer.keys == ["h15"]
+    assert transfer.keys == ["__placeholder__"]
+    assert transfer.host_indices is None
     assert transfer.logical_pages_per_object == 16
 
 
@@ -808,20 +824,115 @@ def test_c128_prefetch_transfer_supports_page_size_thirty_two():
     )
     component.tree_core = SimpleNamespace(page_size=128)
 
-    with patch(
-        "sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component.get_hash_str",
-        return_value=[f"h{i}" for i in range(32)],
-    ):
-        transfer = component.build_hicache_transfers(
-            SimpleNamespace(),
-            phase=CacheTransferPhase.PREFETCH,
-            host_indices=torch.arange(32),
-            token_ids=list(range(4096)),
-            prefetch_tokens=32 * 128,
-        )[0]
+    transfer = component.build_hicache_transfers(
+        SimpleNamespace(),
+        phase=CacheTransferPhase.PREFETCH,
+        staging_tokens=32,
+        token_ids=list(range(4096)),
+        prefetch_tokens=32 * 128,
+    )[0]
 
-    assert transfer.keys == ["h31"]
+    assert transfer.keys == ["__placeholder__"]
+    assert transfer.host_indices is None
     assert transfer.logical_pages_per_object == 32
+
+
+def test_c128_prepare_defers_allocation_until_hit():
+    component, root, _, _ = _make_c128_component_and_path()
+    component._c128_kv_pool_host = Mock()
+    component.cache.evict_host = Mock()
+    result = component.prepare_prefetch(root.id, prefetch_tokens=6144)
+    assert result.staging_tokens == 48
+    component._c128_kv_pool_host.alloc.assert_not_called()
+
+    slots = torch.arange(32)
+    component._c128_kv_pool_host.alloc.side_effect = [None, slots]
+    assert component.alloc_prefetch_staging(32) is slots
+    component.cache.evict_host.assert_called_once_with(4096, ComponentType.FULL)
+    assert component._c128_kv_pool_host.alloc.call_count == 2
+
+
+def test_c128_query_resolves_namespaced_keys_before_exists_and_trims_hit():
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.page_size = 128
+    controller.storage_backend_type = "ascend_memcache"
+    key = RadixKey(list(range(6144)), extra_key="adapter", cache_salt="tenant")
+    hashes = get_storage_hash_str(key, None, page_size=128)
+    transfer = PoolTransfer(
+        PoolName.DEEPSEEK_V4_C128,
+        keys=["__placeholder__"] * 3,
+        logical_pages_per_object=16,
+    )
+    operation = PrefetchOperation(
+        CacheRequestHandle("coarse", 0), key, pool_transfers=[transfer]
+    )
+
+    def exists(actual_hashes, transfers, extra_info):
+        assert actual_hashes == hashes
+        assert transfers[0].keys == hashes[15::16]
+        return PoolTransferResult(32, {PoolName.DEEPSEEK_V4_C128: 2})
+
+    controller.storage_backend = SimpleNamespace(batch_exists_v2=exists)
+    hit_hashes, hit_tokens = controller._storage_hit_query(operation)
+    assert hit_tokens == 4096
+    assert hit_hashes == hashes[:32]
+    assert transfer.keys == [hashes[15], hashes[31]]
+
+
+def test_c128_hit_allocation_counts_objects_not_full_pages():
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.tree_core = SimpleNamespace(page_size=128)
+    pool = SimpleNamespace(page_size=16)
+    cache.cache_controller = SimpleNamespace(
+        mem_pool_host=SimpleNamespace(
+            entry_map={PoolName.DEEPSEEK_V4_C128: SimpleNamespace(host_pool=pool)}
+        )
+    )
+    component = Mock()
+    component.alloc_prefetch_staging.return_value = torch.arange(32)
+    cache.components = {ComponentType.C128: component}
+    transfer = PoolTransfer(
+        PoolName.DEEPSEEK_V4_C128,
+        keys=["h15", "h31", "h47"],
+        logical_pages_per_object=16,
+    )
+    info = SimpleNamespace(comp_xfers={ComponentType.C128: [transfer]})
+    assert cache._alloc_prefetch_aux_staging(info, 4096)
+    component.alloc_prefetch_staging.assert_called_once_with(32)
+    assert transfer.host_indices.numel() == 32
+
+
+def test_pp_c128_ticket_preserves_coverage_and_allocates_only_hit_objects():
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.page_size = 128
+    controller.prefetch_tokens_occupied = 0
+    controller.mem_pool_host = Mock()
+    controller.mem_pool_host.get_pool.return_value = SimpleNamespace(page_size=16)
+    controller.mem_pool_host.alloc.side_effect = lambda size, **kwargs: torch.arange(
+        size
+    )
+    transfer = PoolTransfer(
+        PoolName.DEEPSEEK_V4_C128,
+        keys=["h15", "h31"],
+        logical_pages_per_object=16,
+    )
+    handle = CacheRequestHandle("coarse", 0)
+    key = RadixKey(list(range(4096)))
+    ticket = PPPrefetchTicket(
+        handle,
+        key,
+        None,
+        None,
+        [],
+        (PPPrefetchPoolSpec.from_transfer(transfer),),
+        storage_hit_count=4096,
+    )
+    operation = PrefetchOperation(handle, key)
+    assert controller._allocate_pp_prefetch_buffers(ticket, operation)
+    restored = operation.pool_transfers[0]
+    assert restored.logical_pages_per_object == 16
+    assert restored.host_indices.numel() == 32
+    assert restored.keys == transfer.keys
 
 
 def test_c128_exists_accepts_two_explicit_group_keys():
